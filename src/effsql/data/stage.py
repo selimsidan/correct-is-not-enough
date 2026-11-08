@@ -127,17 +127,15 @@ def stage(
         if not index.dbs and index.nested_zips:
             raise RuntimeError(f"{zip_path} holds nested zips {index.nested_zips[:3]}; not supported yet")
         incomplete = sorted(d for d, m in index.dbs.items() if m.sqlite is None)
-        available = sorted(d for d, m in index.dbs.items() if m.sqlite is not None)
+        available = {d for d, m in index.dbs.items() if m.sqlite is not None}
 
-        if split != db_split:
-            # e.g. minidev: stage exactly the databases its questions use, all of which must be in
-            # the zip of the split it runs on.
-            needed = question_db_ids(split, paths)
-            missing = sorted(set(needed) - set(available))
-            if missing:
-                raise RuntimeError(f"{split} uses db_ids not in {zip_path.name}: {missing}")
-            available = needed
-        selected = select_db_ids(available, db_ids, shard, limit)
+        # The selection universe is the split's question db_ids, the same for every command, so a
+        # given --shard selects the same databases in stage, schema-cache and later steps.
+        universe = question_db_ids(split, paths)
+        missing = sorted(set(universe) - available)
+        if missing:
+            raise RuntimeError(f"{split} uses db_ids not in {zip_path.name}: {missing}")
+        selected = select_db_ids(universe, db_ids, shard, limit)
         if incomplete:
             log.warning("Zip has description folders without a .sqlite for: %s", incomplete)
 

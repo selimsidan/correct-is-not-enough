@@ -15,17 +15,20 @@ splits:
     tables: train/train/train_tables.json
     db_zip: train/train/train_databases.zip
     db_split: train
+    qid: index           # train_<position in train.json>; no question_id field
   dev:
     questions: dev/dev.json
     gold: dev/dev.sql
     tables: dev/dev_tables.json
     db_zip: dev/dev_databases.zip
     db_split: dev
+    qid: question_id     # dev_<question_id>; ids are 0..1533, equal to the position
     tied_gold: dev/dev_tied_append.json
   minidev:
     questions: minidev/MINIDEV/mini_dev_sqlite.json
     gold: minidev/MINIDEV/mini_dev_sqlite_gold.sql
     tables: minidev/MINIDEV/dev_tables.json
+    qid: index           # minidev_<position>: question_ids repeat in mini_dev_sqlite.json
     # Mini-dev (SQLite) runs on the dev databases; nothing is staged separately.
     db_split: dev
     # Only read by `effsql inspect` to diff against the descriptions inside the dev zip.

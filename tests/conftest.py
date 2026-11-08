@@ -124,7 +124,10 @@ def fake_bird(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Paths:
     gold[1] = ("SELECT SUM(amount) FROM orders", "shop")  # gold file differs from the JSON SQL field
     write_gold(dev / "dev.sql", gold)
     write_json(dev / "dev_tables.json", [tables_entry("shop"), tables_entry("school")])
-    write_json(dev / "dev_tied_append.json", [dict(DEV_RECORDS[0], SQL="SELECT count(id) FROM customers")])
+    write_json(dev / "dev_tied_append.json", [
+        dict(DEV_RECORDS[0], SQL="SELECT count(id) FROM customers"),
+        dict(DEV_RECORDS[1], question="Total amount of all orders?", SQL="SELECT total(amount) FROM orders"),
+    ])  # the second is reworded, so EX-tied must drop it
     write_db_zip(
         dev / "dev_databases.zip", "dev_databases",
         {"shop": src / "shop.sqlite", "school": src / "school.sqlite"},
@@ -148,13 +151,14 @@ def fake_bird(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Paths:
 
     # minidev: subset of dev, different order; one description file differs from the dev zip
     md = root / "minidev" / "MINIDEV"
-    mini = [DEV_RECORDS[2], DEV_RECORDS[0]]
+    # question_id 0 appears twice (as in the real mini-dev), the second time reworded
+    mini = [DEV_RECORDS[2], DEV_RECORDS[0], dict(DEV_RECORDS[0], question="Count the customers.")]
     write_json(md / "mini_dev_sqlite.json", mini)
     write_gold(md / "mini_dev_sqlite_gold.sql", [(r["SQL"], r["db_id"]) for r in mini])
     write_json(md / "dev_tables.json", [tables_entry("shop"), tables_entry("school")])
     desc = md / "dev_databases" / "shop" / "database_description"
     desc.mkdir(parents=True)
-    (desc / "customers.csv").write_bytes(CUSTOMERS_CSV)
+    (desc / "Customers.csv").write_bytes(CUSTOMERS_CSV)  # name differs only in case
     (desc / "orders.csv").write_bytes(ORDERS_CSV + b"note,,free text\n")
 
     monkeypatch.setenv("EFFSQL_DRIVE_ROOT", str(root))

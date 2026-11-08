@@ -54,10 +54,29 @@ def test_inspect_all(fake_bird):
     assert r["dev.gold"]["json_sql_vs_gold"]["whitespace_only_diff"] == 0
     assert r["dev.gold"]["json_sql_vs_gold"]["different"] == 1
     assert r["minidev.coverage"]["missing_from_zip"] == []
-    assert r["minidev_vs_dev"]["n_found_in_dev"] == 2
+    assert r["minidev_vs_dev"]["n_found_in_dev"] == 3
     assert r["minidev_vs_dev"]["n_question_and_evidence_identical"] == 2
+    mq = r["minidev.questions"]
+    assert mq["question_id_unique"] is False
+    assert mq["duplicated_question_ids"] == [{
+        "question_id": 0, "file_positions": [1, 2], "records_identical": False,
+        "differing_fields": ["question"], "questions": ["How many customers?", "Count the customers."],
+    }]
     d = r["descriptions_dev_zip_vs_minidev"]
     assert d["all_identical"] is False
-    assert d["per_db"]["shop"]["different"] == ["orders.csv"]
-    assert d["per_db"]["shop"]["identical"] == 1
-    assert r["dev_tied_append"]["n_sql_differs_from_dev_gold"] == 1
+    shop = d["per_db"]["shop"]
+    assert shop["different"] == ["orders.csv"] and shop["identical"] == 1
+    assert shop["only_in_zip"] == [] and shop["only_in_minidev"] == []
+    assert shop["file_name_case_differences"] == 1
+    assert r["dev_tied_append"]["n_sql_differs_from_dev_gold"] == 2
+    assert r["dev_tied_append"]["reworded_question_ids (excluded from EX-tied)"] == [1]
+
+
+def test_shard_universe_is_shared_by_stage_and_schema_cache(fake_bird):
+    # dev universe is [school, shop]; shard 0/2 is [school] for both commands
+    manifest = stage("dev", shard="0/2", paths=fake_bird, data_cfg=CFG)
+    assert list(manifest["dbs"]) == ["school"]
+    written = build_schema_cache("dev", shard="0/2", paths=fake_bird, data_cfg=CFG)
+    assert [p.stem for p in written] == ["school"]
+    with pytest.raises(RuntimeError, match="same"):
+        build_schema_cache("dev", shard="1/2", paths=fake_bird, data_cfg=CFG)

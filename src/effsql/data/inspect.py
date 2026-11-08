@@ -73,6 +73,21 @@ def inspect_questions(records: list[dict[str, Any]]) -> dict[str, Any]:
         out["question_id_range"] = [min(qids), max(qids)]
         out["question_id_unique"] = len(set(qids)) == len(qids)
         out["first_question_ids"] = qids[:5]
+        by_id: dict[Any, list[tuple[int, dict]]] = {}
+        for i, r in enumerate(records):
+            by_id.setdefault(r.get("question_id"), []).append((i, r))
+        dups = [(q, rs) for q, rs in by_id.items() if len(rs) > 1]
+        out["n_duplicated_question_ids"] = len(dups)
+        out["duplicated_question_ids"] = [
+            {
+                "question_id": q,
+                "file_positions": [i for i, _ in rs],
+                "records_identical": all(r == rs[0][1] for _, r in rs),
+                "differing_fields": sorted({k for _, r in rs for k in r if r.get(k) != rs[0][1].get(k)}),
+                "questions": [_short(r.get("question"), 100) for _, r in rs],
+            }
+            for q, rs in dups[:20]
+        ]
     return out
 
 
@@ -167,25 +182,32 @@ def inspect_descriptions(dev_zip: Path, minidev_dir: Path) -> dict[str, Any]:
     with zipfile.ZipFile(dev_zip) as zf:
         idx = index_zip(zf)
         for db_id, m in sorted(idx.dbs.items()):
-            zip_files = {PurePosixPath(i.filename).name: i for i in m.descriptions}
+            # Matched case-insensitively: student_club uses Attendance.csv in one copy and
+            # attendance.csv in the other, and table lookup is case-insensitive anyway.
+            zip_files = {PurePosixPath(i.filename).name.lower(): i for i in m.descriptions}
             mdir = minidev_dir / db_id / "database_description"
-            mini_files = {p.name: p for p in mdir.glob("*.csv") if not is_junk(p.name)} if mdir.exists() else {}
-            identical, norm_identical, different = 0, 0, []
-            for name in sorted(set(zip_files) & set(mini_files)):
-                a, b = zf.read(zip_files[name]), mini_files[name].read_bytes()
+            mini_files = (
+                {p.name.lower(): p for p in mdir.glob("*.csv") if not is_junk(p.name)} if mdir.exists() else {}
+            )
+            identical, norm_identical, different, case_diff = 0, 0, [], 0
+            for key in sorted(set(zip_files) & set(mini_files)):
+                zinfo, mpath = zip_files[key], mini_files[key]
+                case_diff += PurePosixPath(zinfo.filename).name != mpath.name
+                a, b = zf.read(zinfo), mpath.read_bytes()
                 if a == b:
                     identical += 1
                 elif norm(a) == norm(b):
                     norm_identical += 1
                 else:
-                    different.append(name)
+                    different.append(PurePosixPath(zinfo.filename).name)
             per_db[db_id] = {
                 "minidev_folder_exists": mdir.exists(),
-                "only_in_zip": sorted(set(zip_files) - set(mini_files)),
-                "only_in_minidev": sorted(set(mini_files) - set(zip_files)),
+                "only_in_zip": sorted(PurePosixPath(zip_files[k].filename).name for k in set(zip_files) - set(mini_files)),
+                "only_in_minidev": sorted(mini_files[k].name for k in set(mini_files) - set(zip_files)),
                 "identical": identical,
                 "identical_after_whitespace_normalization": norm_identical,
                 "different": different,
+                "file_name_case_differences": case_diff,
             }
     return {
         "all_identical": all(
@@ -198,7 +220,9 @@ def inspect_descriptions(dev_zip: Path, minidev_dir: Path) -> dict[str, Any]:
 def inspect_tied(tied: list[dict[str, Any]], dev: list[dict[str, Any]], dev_gold: list) -> dict[str, Any]:
     dev_by_id = {r["question_id"]: (r, g) for r, g in zip(dev, dev_gold)}
     in_dev = [t for t in tied if t.get("question_id") in dev_by_id]
+    reworded = [t for t in in_dev if t["question"] != dev_by_id[t["question_id"]][0]["question"]]
     return {
+        "reworded_question_ids (excluded from EX-tied)": [t["question_id"] for t in reworded],
         "n_records": len(tied),
         "keys": list(tied[0].keys()) if tied else [],
         "question_ids": [t.get("question_id") for t in tied],

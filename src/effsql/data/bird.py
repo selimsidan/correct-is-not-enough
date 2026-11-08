@@ -10,12 +10,14 @@ The gold file is what the official evaluation reads, so it is the source of `gol
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from effsql.paths import Paths, load_paths
 
+log = logging.getLogger(__name__)
 
 @dataclass
 class Example:
@@ -40,10 +42,17 @@ class GoldLine:
     db_id: str
 
 
-def make_qid(split: str, record: dict[str, Any], index: int) -> str:
-    """Stable id: `<split>_<question_id>` when the record has one, else `<split>_<index>`."""
-    qid = record.get("question_id")
-    return f"{split}_{qid if qid is not None else index}"
+def make_qid(split: str, record: dict[str, Any], index: int, mode: str) -> str:
+    """Stable id per configs/paths.yaml: `<split>_<question_id>` or `<split>_<position>`.
+
+    Mini-dev uses the position because its question_ids repeat (inspect report 2026-11-08);
+    the official evaluation also aligns mini-dev predictions by position.
+    """
+    if mode == "index":
+        return f"{split}_{index}"
+    if record.get("question_id") is None:
+        raise ValueError(f"{split} record {index} has no question_id (set qid: index in paths.yaml)")
+    return f"{split}_{record['question_id']}"
 
 
 def read_questions(path: Path) -> list[dict[str, Any]]:
@@ -77,6 +86,7 @@ def load_examples(split: str, paths: Paths | None = None) -> list[Example]:
     if len(records) != len(gold):
         raise ValueError(f"{split}: {len(records)} questions but {len(gold)} gold lines")
 
+    mode = paths.qid_mode(split)
     examples: list[Example] = []
     for i, (rec, g) in enumerate(zip(records, gold)):
         if rec["db_id"] != g.db_id:
@@ -84,7 +94,7 @@ def load_examples(split: str, paths: Paths | None = None) -> list[Example]:
         json_sql = (rec.get("SQL") or "").strip()
         examples.append(
             Example(
-                qid=make_qid(split, rec, i),
+                qid=make_qid(split, rec, i, mode),
                 bird_question_id=rec.get("question_id"),
                 split=split,
                 db_id=rec["db_id"],
@@ -104,9 +114,17 @@ def load_examples(split: str, paths: Paths | None = None) -> list[Example]:
 def load_tied_gold(paths: Paths | None = None) -> dict[int, GoldLine]:
     """Alternative gold SQL for dev questions with tied answers, keyed by BIRD question_id.
 
-    Used only for the secondary EX-tied metric; headline metrics use the official gold.
-    Applies to minidev too, through bird_question_id.
+    Used only for the secondary EX-tied metric on dev; headline metrics use the official gold.
+    Records whose question text differs from dev's are dropped (3 of 42 in the real file),
+    so an alternative gold never answers a reworded question.
     """
     paths = paths or load_paths()
     records = read_questions(paths.split_file("dev", "tied_gold"))
-    return {int(r["question_id"]): GoldLine(sql=r["SQL"].strip(), db_id=r["db_id"]) for r in records}
+    dev_q = {r["question_id"]: r["question"] for r in read_questions(paths.split_file("dev", "questions"))}
+    kept = {
+        int(r["question_id"]): GoldLine(sql=r["SQL"].strip(), db_id=r["db_id"])
+        for r in records
+        if dev_q.get(r["question_id"]) == r["question"]
+    }
+    log.info("tied gold: kept %d of %d (dropped reworded or unknown questions)", len(kept), len(records))
+    return kept

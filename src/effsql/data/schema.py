@@ -16,8 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from effsql.config import load_config
-from effsql.data.bird import read_questions
-from effsql.data.stage import select_db_ids, staged_db_ids
+from effsql.data.stage import question_db_ids, select_db_ids, staged_db_ids
 from effsql.exec.engine import connect_readonly
 from effsql.io import read_json, write_json
 from effsql.paths import Paths, load_paths
@@ -160,16 +159,14 @@ def build_schema_cache(
     cfg = (data_cfg or load_config("data.yaml")).get("schema", {})
     db_split = paths.db_split(split)
 
-    staged = staged_db_ids(split, paths)
-    if split != db_split:
-        needed = sorted({r["db_id"] for r in read_questions(paths.split_file(split, "questions"))})
-        missing = sorted(set(needed) - set(staged))
-        if missing:
-            raise RuntimeError(f"Not staged yet: {missing}. Run `effsql stage --split {split}`.")
-        staged = needed
-    if not staged:
-        raise RuntimeError(f"No staged databases for {split}. Run `effsql stage --split {split}` first.")
-    selected = select_db_ids(staged, db_ids, shard, limit)
+    # Select from the split's full db_id list (same universe as `stage`), then require staging.
+    selected = select_db_ids(question_db_ids(split, paths), db_ids, shard, limit)
+    not_staged = sorted(set(selected) - set(staged_db_ids(split, paths)))
+    if not_staged:
+        raise RuntimeError(
+            f"Not staged yet: {not_staged}. Run `effsql stage --split {split}` with the same "
+            "--db-ids / --shard / --limit first."
+        )
 
     # Column descriptions come from the staged dev zip copy for both dev and minidev (decision
     # 2026-11-08), and keys from the db split's tables.json, so both splits share identical prompts.
@@ -191,7 +188,13 @@ def build_schema_cache(
         )
         write_json(out, schema)
         written.append(out)
-        log.info("schema cache %s: %d tables", db_id, len(schema["tables"]))
+        n_desc = sum(1 for t in schema["tables"] if t["description_file"])
+        log.info(
+            "schema cache %s: %d tables, %d with descriptions%s",
+            db_id, len(schema["tables"]), n_desc,
+            f", UNMATCHED description files: {schema['unmatched_description_files']}"
+            if schema["unmatched_description_files"] else "",
+        )
     return written
 
 

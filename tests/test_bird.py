@@ -21,8 +21,9 @@ def test_train_examples_use_index_qids(fake_bird):
 
 def test_minidev_keeps_file_order_and_dev_question_ids(fake_bird):
     ex = load_examples("minidev", fake_bird)
-    assert [e.qid for e in ex] == ["minidev_2", "minidev_0"]
-    assert [e.bird_question_id for e in ex] == [2, 0]
+    # qids by position because question_ids repeat in mini-dev
+    assert [e.qid for e in ex] == ["minidev_0", "minidev_1", "minidev_2"]
+    assert [e.bird_question_id for e in ex] == [2, 0, 0]
 
 
 def test_gold_count_mismatch_raises(fake_bird):
@@ -51,3 +52,10 @@ def test_gold_without_tab_raises(tmp_path):
 def test_tied_gold(fake_bird):
     tied = load_tied_gold(fake_bird)
     assert tied[0].sql == "SELECT count(id) FROM customers"
+    assert 1 not in tied  # reworded question is excluded
+
+
+def test_question_id_mode_requires_ids(fake_bird):
+    fake_bird.splits["train"]["qid"] = "question_id"
+    with pytest.raises(ValueError, match="no question_id"):
+        load_examples("train", fake_bird)

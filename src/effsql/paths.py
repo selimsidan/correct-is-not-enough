@@ -59,6 +59,13 @@ class Paths:
         self.assert_not_forbidden(path)
         return path
 
+    def qid_mode(self, split: str) -> str:
+        """How qids are formed: `question_id` (<split>_<question_id>) or `index` (<split>_<position>)."""
+        mode = self._spec(split).get("qid", "question_id")
+        if mode not in ("question_id", "index"):
+            raise ValueError(f"Split {split!r}: qid must be question_id or index, got {mode!r}")
+        return mode
+
     def db_split(self, split: str) -> str:
         """Split whose databases a split runs on (minidev -> dev)."""
         return self._spec(split).get("db_split", split)
