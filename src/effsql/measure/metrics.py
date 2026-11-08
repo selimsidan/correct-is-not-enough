@@ -44,6 +44,7 @@ def group_metrics(
         out["ex_tied"] = _pct([bool(r["correct"] or r.get("correct_tied")) for r in recs])
         out["n_with_tied_gold"] = sum(r.get("correct_tied") is not None for r in recs)
 
+    out["n_correct_without_steps"] = sum(1 for r in recs if r["correct"] and r.get("rel_cost") is None)
     out["rel_cost_median"] = statistics.median(costs) if costs else None
     out["rel_cost_geomean"] = math.exp(statistics.fmean(math.log(c) for c in costs)) if costs else None
     thr = cfg.get("faster_than_gold", 0.9)

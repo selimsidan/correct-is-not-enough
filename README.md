@@ -104,6 +104,9 @@ Predictions: our JSONL (`{"qid": "dev_0", "sql": "..."}` per line) or the offici
 
 `vm_steps` counts SQLite VM instructions through a progress handler (every N = 10 instructions). It is
 deterministic: connections load the schema at open and do not cache prepared statements.
+Counting slows queries 2 to 4x, so execution runs in two passes: correctness at native speed under the
+official 30 s limit (deadline checked every 1000 instructions), then step counting only for ok golds and
+correct predictions, with a 300 s limit.
 Timing presets: `quick` (perf_counter, 1 warm-up, 5 interleaved runs, for development) and
 `official` (exact port, for reported numbers). Timing is always sequential; only the correctness and
 step-counting pass is parallel.

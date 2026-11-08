@@ -2,8 +2,13 @@
 
 Cost: a progress handler is called every `progress_n` VM instructions; vm_steps = calls x N.
 The same handler enforces the wall-clock deadline and the optional step budget by returning
-nonzero, which aborts the query. Counting adds Python callback overhead, so elapsed_ms here is
-NOT a timing measurement; timing lives in measure/timing.py and measure/bird_official.py.
+nonzero, which aborts the query.
+
+Counting every 10 instructions slows queries 2 to 4x (Python callback overhead; measured on
+Colab 2026-11-08), which would make slow-but-valid queries hit the official 30 s limit. So work is
+split in two passes (`execute_two_pass`): correctness at native speed with a deadline-only handler
+every 1000 instructions (about 1% overhead), then step counting only where needed, with its own
+generous limit. elapsed_ms of the counting pass is never used as a timing measurement.
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ import sqlite3
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from effsql.exec.results import result_hash
 from effsql.paths import Paths, load_paths
@@ -23,6 +28,7 @@ from effsql.paths import Paths, load_paths
 log = logging.getLogger(__name__)
 
 ERROR_TYPES = ("parse_fail", "syntax", "runtime", "timeout", "step_budget", "too_many_rows")
+DEADLINE_CHECK_N = 1000  # handler period when only the deadline is checked
 # Messages raised when a statement cannot be compiled (bad syntax or unknown names). Reported as
 # `syntax` to separate "not a valid query for this schema" from failures while running.
 _COMPILE_MARKERS = (
@@ -87,17 +93,20 @@ def execute(
     step_budget: int | None = None,
     max_rows: int = 1_000_000,
     progress_n: int = 10,
+    count_steps: bool = True,
     keep_rows: bool = False,
 ) -> ExecResult:
-    """Run one query, counting VM steps and enforcing the deadline and step budget."""
+    """Run one query. With count_steps, vm_steps is counted every progress_n instructions and the
+    step budget applies; without, only the deadline is checked (near native speed, vm_steps None)."""
     if sql is None or not sql.strip():
         return ExecResult(ok=False, error_type="parse_fail", error_msg="empty SQL")
+    n = progress_n if count_steps else DEADLINE_CHECK_N
     state = {"calls": 0, "reason": None}
     deadline = time.perf_counter() + timeout_s
 
     def on_progress() -> int:
         state["calls"] += 1
-        if step_budget is not None and state["calls"] * progress_n > step_budget:
+        if count_steps and step_budget is not None and state["calls"] * n > step_budget:
             state["reason"] = "step_budget"
             return 1
         if time.perf_counter() > deadline:
@@ -105,24 +114,26 @@ def execute(
             return 1
         return 0
 
-    conn.set_progress_handler(on_progress, progress_n)
+    def steps() -> int | None:
+        return state["calls"] * n if count_steps else None
+
+    conn.set_progress_handler(on_progress, n)
     t0 = time.perf_counter()
     try:
         cur = conn.execute(sql)
         rows = cur.fetchmany(max_rows + 1)
         cur.close()
         elapsed = (time.perf_counter() - t0) * 1000
-        steps = state["calls"] * progress_n
         if len(rows) > max_rows:
             return ExecResult(ok=False, error_type="too_many_rows", error_msg=f"more than {max_rows} rows",
-                              vm_steps=steps, elapsed_ms=elapsed)
-        return ExecResult(ok=True, n_rows=len(rows), result_hash=result_hash(rows), vm_steps=steps,
+                              vm_steps=steps(), elapsed_ms=elapsed)
+        return ExecResult(ok=True, n_rows=len(rows), result_hash=result_hash(rows), vm_steps=steps(),
                           elapsed_ms=elapsed, rows=rows if keep_rows else None)
     except Exception as e:  # noqa: BLE001 (any failure of generated SQL is a result, not a crash)
         elapsed = (time.perf_counter() - t0) * 1000
         etype = state["reason"] or classify_error(e)
         return ExecResult(ok=False, error_type=etype, error_msg=f"{type(e).__name__}: {e}"[:500],
-                          vm_steps=state["calls"] * progress_n, elapsed_ms=elapsed)
+                          vm_steps=steps(), elapsed_ms=elapsed)
     finally:
         conn.set_progress_handler(None, 0)
 
@@ -181,6 +192,40 @@ def execute_many(
         return
     with mp.get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(paths, exec_kwargs)) as pool:
         yield from pool.imap_unordered(_run_job, jobs, chunksize=1)
+
+
+def execute_two_pass(
+    jobs: list[dict[str, Any]],
+    paths: Paths,
+    exec_cfg: dict[str, Any],
+    count_if: Callable[[dict[str, Any]], bool],
+    workers: int | None = None,
+) -> dict[Any, dict[str, Any]]:
+    """Correctness at native speed, then vm_steps for the records where count_if(record) is true.
+
+    Pass 1: official timeout (exec_cfg.timeout_s), deadline check only; gives ok, error_type,
+            result_hash, n_rows, elapsed_ms (near native) and, for jobs with `features`, plan
+            and text features.
+    Pass 2: counted every progress_n instructions with exec_cfg.count_timeout_s; fills vm_steps,
+            or leaves it None with `steps_error` when counting fails (e.g. the longer limit).
+    """
+    first = {
+        r["key"]: r
+        for r in execute_many(jobs, paths, workers=workers, timeout_s=exec_cfg["timeout_s"],
+                              max_rows=exec_cfg["max_rows"], count_steps=False)
+    }
+    second_jobs = [{k: v for k, v in j.items() if k != "features"} for j in jobs if count_if(first[j["key"]])]
+    for r in execute_many(second_jobs, paths, workers=workers, timeout_s=exec_cfg["count_timeout_s"],
+                          step_budget=exec_cfg.get("step_budget"), max_rows=exec_cfg["max_rows"],
+                          progress_n=exec_cfg["progress_n"], count_steps=True):
+        rec = first[r["key"]]
+        if not r["ok"]:
+            rec["steps_error"] = r["error_type"]
+        elif r["result_hash"] != rec["result_hash"]:
+            rec["steps_error"] = "result_changed"  # should never happen; recorded rather than trusted
+        else:
+            rec["vm_steps"] = r["vm_steps"]
+    return first
 
 
 def batched(it: Iterable[Any], n: int) -> Iterator[list[Any]]:

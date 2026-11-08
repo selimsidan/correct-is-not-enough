@@ -13,11 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from effsql.data.bird import Example
-from effsql.exec.engine import batched, execute_many
+from effsql.exec.engine import batched, execute_two_pass
 from effsql.io import append_jsonl, iter_jsonl
 from effsql.paths import Paths
 
 log = logging.getLogger(__name__)
+# 2: correctness and step counting in separate passes (2026-11-08); older records are recomputed.
+CACHE_VERSION = 2
+CHUNK = 500  # jobs per two-pass round (bounds work lost on a disconnect)
 
 
 def gold_sha(db_id: str, sql: str) -> str:
@@ -52,24 +55,26 @@ def ensure_gold_costs(
         if k not in cached
         or cached[k].get("gold_sha") != gold_sha(db, sql)
         or cached[k].get("progress_n") != exec_cfg["progress_n"]  # steps depend on N
+        or cached[k].get("cache_version") != CACHE_VERSION
     ]
     if todo:
         log.info("gold costs %s: computing %d of %d", split, len(todo), len(golds))
-        meta = {j["key"]: (j["db_id"], j["gold_sha"]) for j in todo}
-        stream = execute_many(
-            todo, paths, workers=workers,
-            timeout_s=exec_cfg["timeout_s"], step_budget=None,
-            max_rows=exec_cfg["max_rows"], progress_n=exec_cfg["progress_n"],
-        )
-        for batch in batched(stream, 50):
+        # Gold steps are never budget-limited: every ok gold needs a cost.
+        cfg = {**exec_cfg, "step_budget": None}
+        for chunk in batched(todo, CHUNK):
+            results = execute_two_pass(chunk, paths, cfg, count_if=lambda r: r["ok"], workers=workers)
             recs = []
-            for r in batch:
-                db_id, sha = meta[r["key"]]
-                r.update(db_id=db_id, gold_sha=sha, progress_n=exec_cfg["progress_n"])
+            for j in chunk:
+                r = results[j["key"]]
+                r.update(db_id=j["db_id"], gold_sha=j["gold_sha"], progress_n=exec_cfg["progress_n"],
+                         cache_version=CACHE_VERSION)
                 r["gold_status"] = gold_status(r)
                 recs.append(r)
                 cached[r["key"]] = r
             append_jsonl(path, recs)
+        n_no_steps = sum(1 for j in todo if cached[j["key"]]["ok"] and cached[j["key"]]["vm_steps"] is None)
+        if n_no_steps:
+            log.warning("gold costs %s: %d ok golds have no vm_steps (counting pass failed)", split, n_no_steps)
     return {k: cached[k] for k in golds}
 
 

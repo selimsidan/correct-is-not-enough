@@ -1,7 +1,7 @@
 import pytest
 
 from effsql.data.stage import stage
-from effsql.exec.engine import connect_readonly, execute, execute_many
+from effsql.exec.engine import connect_readonly, execute, execute_many, execute_two_pass
 from effsql.exec.results import result_hash
 from effsql.measure.correctness import calculate_ex
 
@@ -101,3 +101,24 @@ def test_execute_many_parallel_matches_serial(fake_bird, shop):
         assert serial[k]["vm_steps"] == parallel[k]["vm_steps"]
     assert serial[0]["plan"]["plan_ok"] and serial[0]["text"]["text_ok"]
     assert serial[2]["error_type"] == "syntax" and "plan" not in serial[2]
+
+
+def test_uncounted_execution_has_no_steps_but_same_result(shop):
+    sql = "SELECT name FROM customers WHERE id > 2"
+    fast, counted = execute(shop, sql, count_steps=False), execute(shop, sql)
+    assert fast.vm_steps is None and counted.vm_steps > 0
+    assert fast.result_hash == counted.result_hash
+    assert execute(shop, RUNAWAY, timeout_s=0.2, count_steps=False).error_type == "timeout"
+
+
+def test_two_pass_separates_correctness_from_counting(fake_bird, shop):
+    cfg = {"timeout_s": 30, "count_timeout_s": 30, "max_rows": 1000, "progress_n": 10, "step_budget": None}
+    jobs = [{"key": k, "db_path": fake_bird.local_db_path("dev", "shop"), "sql": sql} for k, sql in
+            [("a", "SELECT name FROM customers WHERE id > 2"), ("b", "SELECT amount FROM orders"), ("c", "SELEC")]]
+    res = execute_two_pass(jobs, fake_bird, cfg, count_if=lambda r: r["key"] != "b", workers=1)
+    assert res["a"]["ok"] and res["a"]["vm_steps"] > 0
+    assert res["b"]["ok"] and res["b"]["vm_steps"] is None          # not selected for counting
+    assert res["c"]["error_type"] == "syntax" and res["c"].get("vm_steps") is None
+    # a counting failure (here: a step budget) leaves correctness intact and records steps_error
+    res = execute_two_pass(jobs[:1], fake_bird, {**cfg, "step_budget": 5}, count_if=lambda r: True, workers=1)
+    assert res["a"]["ok"] and res["a"]["vm_steps"] is None and res["a"]["steps_error"] == "step_budget"

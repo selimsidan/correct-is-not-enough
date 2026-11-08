@@ -83,7 +83,7 @@ def test_evaluate_resumes(staged, cfg, monkeypatch):
     def boom(*a, **k):
         raise AssertionError("should not execute again")
 
-    monkeypatch.setattr(ev, "execute_many", boom)
+    monkeypatch.setattr(ev, "execute_two_pass", boom)
     m = evaluate("gold", "dev", "r", paths=staged, cfg=cfg)  # gold costs cached, eval file complete
     assert m["overall"]["ex"] == 100.0
     assert len(read_jsonl(staged.run_dir("r") / "eval_dev.jsonl")) == 3

@@ -20,7 +20,7 @@ from typing import Any
 
 from effsql.config import load_config, save_config
 from effsql.data.bird import Example, load_examples, load_tied_gold
-from effsql.exec.engine import batched, connect_readonly, execute_many
+from effsql.exec.engine import batched, connect_readonly, execute_two_pass
 from effsql.io import append_jsonl, done_ids, iter_jsonl, write_json
 from effsql.measure.bird_official import iterated_execute_sql
 from effsql.measure.correctness import hashes_match
@@ -34,6 +34,7 @@ from effsql.runmeta import write_run_meta
 log = logging.getLogger(__name__)
 OFFICIAL_SEP = "\t----- bird -----\t"
 TIMING_PRESETS = ("none", "quick", "official")
+CHUNK = 500  # predictions per two-pass round; results are appended after each
 LEDGER_COLUMNS = [
     "timestamp", "run", "git_commit", "git_dirty", "model", "method", "split", "n", "timing", "repeats",
     "ex", "ex_tied", "rves_mean", "rves_std", "ves_mean", "ves_std", "quick_ratio_median",
@@ -90,26 +91,33 @@ def correctness_pass(
         return
     log.info("correctness: %d to run (%d already done)", len(jobs), len(done))
     c = exec_cfg["progress_n"]
-    stream = execute_many(
-        jobs, paths, workers=workers, timeout_s=exec_cfg["timeout_s"],
-        step_budget=exec_cfg.get("step_budget"), max_rows=exec_cfg["max_rows"], progress_n=c,
-    )
-    for batch in batched(stream, 50):
+
+    def is_correct(r: dict[str, Any]) -> bool:
+        g = golds[r["key"]]
+        return bool(r["ok"] and g["ok"] and hashes_match(r["result_hash"], g["result_hash"]))
+
+    # Steps are counted only for correct predictions: relative cost is defined on those alone.
+    for chunk in batched(jobs, CHUNK):
+        results = execute_two_pass(chunk, paths, exec_cfg, count_if=is_correct, workers=workers)
         recs = []
-        for r in batch:
+        for j in chunk:
+            r = results[j["key"]]
             e, g = by_qid[r["key"]], golds[r["key"]]
             tied = golds.get(f"{e.qid}#tied")
-            correct = r["ok"] and g["ok"] and hashes_match(r["result_hash"], g["result_hash"])
+            correct = is_correct(r)
+            steps, gold_steps = r.get("vm_steps"), g.get("vm_steps")
             recs.append({
                 "qid": e.qid, "db_id": e.db_id, "difficulty": e.difficulty,
                 "pred_sql": preds.get(e.qid, ""),
-                "correct": bool(correct),
+                "correct": correct,
                 "correct_tied": (bool(r["ok"] and tied["ok"] and hashes_match(r["result_hash"], tied["result_hash"]))
                                  if tied else None),
                 "error_type": r["error_type"], "error_msg": r["error_msg"],
-                "n_rows": r["n_rows"], "vm_steps": r["vm_steps"], "gold_vm_steps": g["vm_steps"],
-                "gold_status": g["gold_status"], "gold_elapsed_ms": g["elapsed_ms"],
-                "rel_cost": rel_cost(r["vm_steps"], g["vm_steps"], c) if correct else None,
+                "n_rows": r["n_rows"], "elapsed_ms": r["elapsed_ms"],
+                "vm_steps": steps, "steps_error": r.get("steps_error"),
+                "gold_vm_steps": gold_steps, "gold_status": g["gold_status"], "gold_elapsed_ms": g["elapsed_ms"],
+                "rel_cost": (rel_cost(steps, gold_steps, c)
+                             if correct and steps is not None and gold_steps is not None else None),
             })
         append_jsonl(out_path, recs)
 
@@ -130,7 +138,7 @@ def timing_pass(
         # budget is meta_time_out * iterate_num) are executed.
         run = [e for e in todo if eval_recs[e.qid]["correct"] or eval_recs[e.qid]["error_type"] == "timeout"]
         est = sum(2 * cfg["iterate_num"] * _gold_seconds(eval_recs[e.qid]) for e in run)
-        log.info("official timing: %d questions to time, rough upper-bound ETA %.1f min", len(run), est / 60)
+        log.info("official timing: %d questions to time, rough ETA %.1f min", len(run), est / 60)
     t_start = time.time()
     conns: dict[str, Any] = {}
     try:
@@ -164,8 +172,8 @@ def timing_pass(
 
 
 def _gold_seconds(rec: dict[str, Any]) -> float:
-    """Per-execution gold time from the step-counting pass. The counter's callbacks slow the query,
-    so this overestimates, which is the safe side for an ETA."""
+    """Per-execution gold time from the native-speed correctness pass (warm connection, so a fresh
+    official connection may be slightly slower)."""
     return (rec.get("gold_elapsed_ms") or 0.0) / 1000.0
 
 

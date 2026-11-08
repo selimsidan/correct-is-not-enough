@@ -1,6 +1,9 @@
 exec:
-  # Per-query wall-clock limit for correctness and step counting (official meta_time_out is 30 s).
+  # Two passes (see exec/engine.py): correctness at native speed, then step counting.
+  # Pass 1 per-query limit, as the official meta_time_out (30 s).
   timeout_s: 30
+  # Pass 2 limit: counting every 10 instructions slows queries 2 to 4x, so it gets more time.
+  count_timeout_s: 300
   # Optional cap on VM steps (null = none). Useful for train screening of runaway candidates.
   step_budget: null
   # Rows fetched before a result counts as too_many_rows (protects memory).
