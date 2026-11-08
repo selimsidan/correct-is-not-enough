@@ -4,7 +4,7 @@ Efficiency-aware text-to-SQL with small open LLMs on [BIRD](https://bird-bench.g
 CMPE 586 term project. The `effsql` package generates candidate SQL, measures correctness and cost,
 builds a candidate pool for later SFT and DPO, and evaluates predictions with EX, VES and R-VES.
 
-Status: **stage 1** (skeleton, paths, inspection, staging, loader, schema cache).
+Status: **stage 2** (execution engine, cost, timing, official EX / VES / R-VES port, `evaluate`).
 
 ## Where things live
 
@@ -48,9 +48,10 @@ Paths are set in [configs/paths.yaml](configs/paths.yaml) and two env vars:
 | Notebook | Runtime | Open |
 |---|---|---|
 | `00_setup_and_stage` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/00_setup_and_stage.ipynb) |
+| `40_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/40_evaluate.ipynb) |
 
 Later stages add `10_generate` (GPU), `20_screen_and_rewrite` (CPU, then GPU), `30_build_and_verify_pool` (CPU),
-`40_evaluate` (CPU) and `50_analysis` (CPU). Only LLM generation uses a GPU.
+and `50_analysis` (CPU). Only LLM generation uses a GPU.
 
 Notebooks contain no logic: the setup cell, then `!effsql ...` calls.
 
@@ -75,6 +76,37 @@ effsql schema-cache --split train --shard 0/8
 `--db-ids a,b`, `--shard i/n` and `--limit N` select databases for every command. Shards are round-robin
 over sorted db_ids, so the same shard spec always selects the same databases. Staging is idempotent
 and refuses to run if the selected databases will not fit on the local disk.
+
+## Commands (stage 2)
+
+```bash
+effsql gold-cache --split dev                    # gold result hash, vm_steps, plan per question (cached)
+effsql evaluate --pred gold --split dev --run sanity_gold_dev               # gold vs gold, EX only
+effsql evaluate --pred preds.jsonl --split dev --run my_model --model M --method base
+effsql evaluate --pred preds.jsonl --split minidev --timing official --repeat 3 --run my_model_rves
+effsql export-official --pred preds.jsonl --split minidev --out /content/official_check
+```
+
+Predictions: our JSONL (`{"qid": "dev_0", "sql": "..."}` per line) or the official JSON
+(`{"0": "SQL\t----- bird -----\tdb_id"}`, aligned by position). `--pred gold` scores the gold SQL.
+
+### Metrics
+
+| Metric | Definition |
+|---|---|
+| EX | `set(pred_rows) == set(gold_rows)`, ported from BIRD mini-dev `evaluation_ex.py` |
+| EX-tied (dev) | EX where a match with the alternative gold in `dev_tied_append.json` also counts (39 of 42 used) |
+| R-VES | mini-dev `evaluation_ves.py`: 100 timed runs per correct pair, 3-sigma cleaning, reward buckets, `mean(sqrt(reward)) * 100` |
+| VES | original BIRD formula `mean(sqrt(time_ratio)) * 100`, on the same timing loop |
+| relative cost | `(steps_pred + c) / (steps_gold + c)` for correct predictions, c = progress handler period |
+| faster than gold | share of correct predictions with relative cost below 0.9 |
+| efficient accuracy at tau | share of questions that are correct with relative cost <= tau |
+
+`vm_steps` counts SQLite VM instructions through a progress handler (every N = 10 instructions). It is
+deterministic: connections load the schema at open and do not cache prepared statements.
+Timing presets: `quick` (perf_counter, 1 warm-up, 5 interleaved runs, for development) and
+`official` (exact port, for reported numbers). Timing is always sequential; only the correctness and
+step-counting pass is parallel.
 
 ## Local development
 

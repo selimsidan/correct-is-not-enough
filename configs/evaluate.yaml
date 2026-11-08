@@ -1,0 +1,29 @@
+exec:
+  # Per-query wall-clock limit for correctness and step counting (official meta_time_out is 30 s).
+  timeout_s: 30
+  # Optional cap on VM steps (null = none). Useful for train screening of runaway candidates.
+  step_budget: null
+  # Rows fetched before a result counts as too_many_rows (protects memory).
+  max_rows: 1000000
+  # Progress handler period in VM instructions: vm_steps = callbacks x progress_n.
+  # Also the smoothing constant c in relative cost and eff_score.
+  progress_n: 10
+  # Worker processes for correctness and step counting (null = all CPUs). Never used for timing.
+  workers: null
+
+timing:
+  quick:
+    warmup: 1
+    runs: 5
+    timeout_s: 30
+    # Pairs whose gold or prediction timings have a coefficient of variation above this are flagged.
+    cv_threshold: 0.2
+  official:
+    # Exactly the official mini-dev settings (evaluation_ves.py defaults).
+    iterate_num: 100
+    meta_time_out: 30.0
+
+metrics:
+  # A correct prediction is "faster than gold" when its relative cost is below this.
+  faster_than_gold: 0.9
+  taus: [1.0, 1.5, 2.0]
