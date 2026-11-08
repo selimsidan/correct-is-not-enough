@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 log = logging.getLogger(__name__)
 
@@ -50,9 +50,19 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return list(iter_jsonl(path))
 
 
-def done_ids(path: Path, key: str = "qid") -> set[Any]:
-    """IDs already present in an output file; commands skip these unless --overwrite is given."""
-    return {rec[key] for rec in iter_jsonl(path) if key in rec}
+def done_ids(path: Path, key: str = "qid", where: Callable[[dict[str, Any]], bool] | None = None) -> set[Any]:
+    """IDs already present in an output file; commands skip these unless --overwrite is given.
+    `where` restricts to records that still count as done (e.g. the current measurement version)."""
+    return {rec[key] for rec in iter_jsonl(path) if key in rec and (where is None or where(rec))}
+
+
+def latest_by(path: Path, key: str = "qid", where: Callable[[dict[str, Any]], bool] | None = None) -> dict[Any, dict[str, Any]]:
+    """Last record per key among those matching `where` (later appends supersede earlier ones)."""
+    out: dict[Any, dict[str, Any]] = {}
+    for rec in iter_jsonl(path):
+        if key in rec and (where is None or where(rec)):
+            out[rec[key]] = rec
+    return out
 
 
 def write_json(path: Path, obj: Any) -> None:

@@ -103,3 +103,25 @@ def test_export_official(staged, tmp_path):
 def test_evaluate_never_imports_gpu_stack(staged, cfg):
     evaluate("gold", "dev", "g", paths=staged, cfg=cfg)
     assert "vllm" not in sys.modules and "torch" not in sys.modules
+
+
+def test_stale_eval_version_is_recomputed(staged, cfg):
+    evaluate("gold", "dev", "v", paths=staged, cfg=cfg)
+    path = staged.run_dir("v") / "eval_dev.jsonl"
+    # simulate records written by an older measurement version that got a wrong answer
+    stale = [dict(r, eval_version=1, correct=False, error_type="timeout") for r in read_jsonl(path)]
+    path.write_text("".join(json.dumps(r) + "\n" for r in stale))
+    m = evaluate("gold", "dev", "v", paths=staged, cfg=cfg)
+    assert m["overall"]["ex"] == 100.0  # old records ignored, recomputed with the current version
+    recs = read_jsonl(path)
+    assert len(recs) == 6 and sum(r["eval_version"] == 2 for r in recs) == 3
+
+
+def test_io_latest_by_and_done_ids_filter(tmp_path):
+    from effsql.io import append_jsonl, done_ids, latest_by
+
+    p = tmp_path / "x.jsonl"
+    append_jsonl(p, [{"qid": "a", "v": 1, "x": 1}, {"qid": "b", "v": 2, "x": 2}, {"qid": "a", "v": 2, "x": 3}])
+    assert done_ids(p, where=lambda r: r["v"] == 2) == {"a", "b"}
+    assert done_ids(p, where=lambda r: r["v"] == 1) == {"a"}
+    assert latest_by(p)["a"]["x"] == 3 and latest_by(p, where=lambda r: r["v"] == 1)["a"]["x"] == 1

@@ -21,7 +21,7 @@ from typing import Any
 from effsql.config import load_config, save_config
 from effsql.data.bird import Example, load_examples, load_tied_gold
 from effsql.exec.engine import batched, connect_readonly, execute_two_pass
-from effsql.io import append_jsonl, done_ids, iter_jsonl, write_json
+from effsql.io import append_jsonl, done_ids, iter_jsonl, latest_by, write_json
 from effsql.measure.bird_official import iterated_execute_sql
 from effsql.measure.correctness import hashes_match
 from effsql.measure.cost import rel_cost
@@ -35,6 +35,14 @@ log = logging.getLogger(__name__)
 OFFICIAL_SEP = "\t----- bird -----\t"
 TIMING_PRESETS = ("none", "quick", "official")
 CHUNK = 500  # predictions per two-pass round; results are appended after each
+# Version of the per-question measurement. Bump whenever correctness, step counting or timing
+# semantics change: records from other versions are recomputed instead of being resumed.
+# 2: correctness and step counting in separate passes (2026-11-08).
+EVAL_VERSION = 2
+
+
+def is_current(rec: dict[str, Any]) -> bool:
+    return rec.get("eval_version") == EVAL_VERSION
 LEDGER_COLUMNS = [
     "timestamp", "run", "git_commit", "git_dirty", "model", "method", "split", "n", "timing", "repeats",
     "ex", "ex_tied", "rves_mean", "rves_std", "ves_mean", "ves_std", "quick_ratio_median",
@@ -81,7 +89,11 @@ def correctness_pass(
     examples: list[Example], preds: dict[str, str], golds: dict[str, dict[str, Any]], out_path: Path,
     paths: Paths, split: str, exec_cfg: dict[str, Any], workers: int | None,
 ) -> None:
-    done = done_ids(out_path)
+    done = done_ids(out_path, where=is_current)
+    stale = done_ids(out_path) - done
+    if done or stale:
+        log.info("%s: reusing %d current records, recomputing %d from an older eval version",
+                 out_path.name, len(done & {e.qid for e in examples}), len(stale & {e.qid for e in examples}))
     by_qid = {e.qid: e for e in examples}
     jobs = [
         {"key": e.qid, "db_path": paths.local_db_path(split, e.db_id), "sql": preds.get(e.qid, "")}
@@ -107,7 +119,7 @@ def correctness_pass(
             correct = is_correct(r)
             steps, gold_steps = r.get("vm_steps"), g.get("vm_steps")
             recs.append({
-                "qid": e.qid, "db_id": e.db_id, "difficulty": e.difficulty,
+                "qid": e.qid, "eval_version": EVAL_VERSION, "db_id": e.db_id, "difficulty": e.difficulty,
                 "pred_sql": preds.get(e.qid, ""),
                 "correct": correct,
                 "correct_tied": (bool(r["ok"] and tied["ok"] and hashes_match(r["result_hash"], tied["result_hash"]))
@@ -127,7 +139,9 @@ def timing_pass(
     paths: Paths, split: str, timing_cfg: dict[str, Any],
 ) -> None:
     """Sequential timing of every question for one repeat."""
-    done = done_ids(out_path)
+    done = done_ids(out_path, where=is_current)
+    if done:
+        log.info("%s: reusing %d current records", out_path.name, len(done & {e.qid for e in examples}))
     todo = [e for e in examples if e.qid not in done]
     if not todo:
         return
@@ -163,6 +177,7 @@ def timing_pass(
                 else:
                     out = {"qid": e.qid, "correct": False, "time_ratio": 0.0, "reward": 0,
                            "skipped": "incorrect in correctness pass"}
+            out["eval_version"] = EVAL_VERSION
             append_jsonl(out_path, [out])
             if k % 25 == 0:
                 log.info("%s timing: %d/%d (%.0f s)", preset, k, len(todo), time.time() - t_start)
@@ -247,7 +262,7 @@ def evaluate(
     tied = load_tied_gold(paths) if split == "dev" else None
     golds = ensure_gold_costs(split, golds_for(examples, tied), paths, exec_cfg, workers)
     correctness_pass(examples, preds, golds, eval_path, paths, split, exec_cfg, workers)
-    eval_recs = {r["qid"]: r for r in iter_jsonl(eval_path)}
+    eval_recs = latest_by(eval_path, where=is_current)
     recs = [eval_recs[e.qid] for e in examples]
 
     timing_runs: list[dict[str, dict[str, Any]]] = []
@@ -255,7 +270,7 @@ def evaluate(
         for i in range(repeat):
             tpath = run_dir / f"timing_{timing}_{split}_r{i}.jsonl"
             timing_pass(timing, examples, eval_recs, tpath, paths, split, cfg["timing"])
-            timing_runs.append({r["qid"]: r for r in iter_jsonl(tpath)})
+            timing_runs.append(latest_by(tpath, where=is_current))
 
     metrics = compute_metrics(recs, timing_runs, timing, cfg.get("metrics", {}))
     metrics["n_gold_not_ok"] = sum(1 for r in recs if r["gold_status"] != "ok")
