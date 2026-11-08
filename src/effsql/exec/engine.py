@@ -155,7 +155,8 @@ def _run_job(job: dict[str, Any]) -> dict[str, Any]:
     conn = _worker_conns.get(db_path)
     if conn is None:
         conn = _worker_conns[db_path] = connect_readonly(Path(db_path), _worker_paths)
-    res = execute(conn, job["sql"], **_worker_kwargs)
+    # Per-job overrides (e.g. a step budget relative to this question's gold cost).
+    res = execute(conn, job["sql"], **{**_worker_kwargs, **job.get("exec", {})})
     out = {"key": job["key"], **res.record()}
     if job.get("features") and res.ok:
         from effsql.measure.cost import plan_features, text_features
@@ -214,13 +215,19 @@ def execute_two_pass(
         for r in execute_many(jobs, paths, workers=workers, timeout_s=exec_cfg["timeout_s"],
                               max_rows=exec_cfg["max_rows"], count_steps=False)
     }
-    second_jobs = [{k: v for k, v in j.items() if k != "features"} for j in jobs if count_if(first[j["key"]])]
+    # `count_exec` on a job holds overrides that apply to the counting pass only.
+    second_jobs = [
+        {**{k: v for k, v in j.items() if k not in ("features", "exec", "count_exec")}, "exec": j.get("count_exec", {})}
+        for j in jobs if count_if(first[j["key"]])
+    ]
     for r in execute_many(second_jobs, paths, workers=workers, timeout_s=exec_cfg["count_timeout_s"],
                           step_budget=exec_cfg.get("step_budget"), max_rows=exec_cfg["max_rows"],
                           progress_n=exec_cfg["progress_n"], count_steps=True):
         rec = first[r["key"]]
         if not r["ok"]:
             rec["steps_error"] = r["error_type"]
+            if r["error_type"] == "step_budget":
+                rec["steps_lower_bound"] = r["vm_steps"]  # cost is at least this (censored)
         elif r["result_hash"] != rec["result_hash"]:
             rec["steps_error"] = "result_changed"  # should never happen; recorded rather than trusted
         else:

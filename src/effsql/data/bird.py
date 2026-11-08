@@ -128,3 +128,22 @@ def load_tied_gold(paths: Paths | None = None) -> dict[int, GoldLine]:
     }
     log.info("tied gold: kept %d of %d (dropped reworded or unknown questions)", len(kept), len(records))
     return kept
+
+
+def select_questions(examples: list[Example], limit: int | None) -> list[Example]:
+    """First `limit` questions taken round-robin across databases (sorted db_id, file order within
+    a database), so a small smoke run covers many databases instead of the first one only."""
+    if not limit:
+        return examples
+    by_db: dict[str, list[Example]] = {}
+    for e in examples:
+        by_db.setdefault(e.db_id, []).append(e)
+    queues = [by_db[d] for d in sorted(by_db)]
+    out: list[Example] = []
+    i = 0
+    while len(out) < limit and any(i < len(q) for q in queues):
+        for q in queues:
+            if i < len(q) and len(out) < limit:
+                out.append(q[i])
+        i += 1
+    return out

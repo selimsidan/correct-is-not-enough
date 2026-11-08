@@ -81,6 +81,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     m = evaluate(
         args.pred, args.split, args.run, timing=args.timing, repeat=args.repeat, limit=args.limit,
         workers=args.workers, model=args.model, method=args.method, overwrite=args.overwrite,
+        only_predicted=args.only_predicted,
     )
     print(json.dumps(m, indent=2, default=str))
 
@@ -92,6 +93,94 @@ def cmd_export_official(args: argparse.Namespace) -> None:
 
     info = export_official(args.pred, args.split, Path(args.out), limit=args.limit)
     print(json.dumps(info, indent=2))
+
+
+def cmd_generate(args: argparse.Namespace) -> None:
+    from effsql.config import load_config
+    from effsql.gen.backend import make_backend
+    from effsql.gen.sample import generate
+
+    cfg = load_config(args.config)
+    stats = generate(args.split, args.run, make_backend(cfg), cfg=cfg, limit=args.limit,
+                     db_ids=_csv_list(args.db_ids), shard=args.shard, analysis=args.analysis)
+    print(json.dumps(stats, indent=2, default=str))
+
+
+def cmd_parse(args: argparse.Namespace) -> None:
+    from effsql.gen.parse import parse_run
+
+    print(json.dumps(parse_run(args.split, args.run), indent=2))
+
+
+def cmd_screen(args: argparse.Namespace) -> None:
+    from effsql.pool.screen import screen
+
+    print(json.dumps(screen(args.split, args.run, workers=args.workers), indent=2))
+
+
+def cmd_diversity(args: argparse.Namespace) -> None:
+    from effsql.pool.diversity import diversity
+
+    print(json.dumps(diversity(args.split, args.run, args.round), indent=2))
+
+
+def cmd_rewrite(args: argparse.Namespace) -> None:
+    from effsql.config import load_config
+    from effsql.gen.backend import make_backend
+    from effsql.gen.rewrite import rewrite
+
+    gen_cfg = load_config(args.gen_config)
+    stats = rewrite(args.run, make_backend(gen_cfg), round_=args.round, cfg=load_config(args.config),
+                    gen_cfg=gen_cfg, limit=args.limit)
+    print(json.dumps(stats, indent=2, default=str))
+
+
+def cmd_build_pool(args: argparse.Namespace) -> None:
+    from effsql.pool.build import build_pool
+
+    df = build_pool(args.split, args.run)
+    print(f"Pool: {len(df)} candidates, {df['qid'].nunique()} questions, {int(df['correct'].sum())} correct")
+
+
+def cmd_verify_pool(args: argparse.Namespace) -> None:
+    from effsql.pool.verify import verify_pool
+
+    print(json.dumps(verify_pool(args.split, args.run, sample=args.sample), indent=2, default=str))
+
+
+def cmd_summary(args: argparse.Namespace) -> None:
+    from effsql.pool.summary import summarize
+
+    print(json.dumps(summarize(args.split, args.run), indent=2, default=str))
+
+
+def cmd_predict(args: argparse.Namespace) -> None:
+    from effsql.config import load_config
+    from effsql.gen.backend import make_backend
+    from effsql.gen.predict import predict
+
+    cfg = load_config(args.config)
+    if args.model:
+        cfg["model"]["id"] = args.model
+    stats = predict(args.split, args.prompt, args.run, make_backend(cfg), cfg=cfg, limit=args.limit,
+                    adapter=args.adapter)
+    print(json.dumps(stats, indent=2, default=str))
+
+
+def cmd_render_prompt(args: argparse.Namespace) -> None:
+    from effsql.data.bird import load_examples
+    from effsql.data.schema import load_schema
+    from effsql.gen.prompts import build_question_prompt, estimate_tokens, load_templates
+
+    from effsql.config import load_config
+
+    cfg = load_config("generate.yaml")
+    ex = {e.qid: e for e in load_examples(args.split)}[args.qid]
+    msgs, level, n = build_question_prompt(load_templates(), args.prompt, ex, load_schema(args.split, ex.db_id),
+                                           cfg["prompt"]["max_prompt_tokens"], estimate_tokens)
+    for m in msgs:
+        print(f"===== {m['role']} =====\n{m['content']}\n")
+    print(f"(shrink level: {level}, about {n} tokens by character estimate)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -133,6 +222,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", help="model id, recorded in the ledger")
     p.add_argument("--method", help="method name, recorded in the ledger")
     p.add_argument("--overwrite", action="store_true", help="discard this run's previous eval files")
+    p.add_argument("--only-predicted", action="store_true",
+                   help="score only questions that have a prediction (smoke runs; not for reported numbers)")
     p.set_defaults(func=cmd_evaluate)
 
     p = sub.add_parser("export-official", help="write predictions in the official mini-dev format")
@@ -141,6 +232,73 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True)
     p.add_argument("--limit", type=int)
     p.set_defaults(func=cmd_export_official)
+
+    p = sub.add_parser("generate", help="[GPU] candidate SQL for train questions (greedy + samples per prompt)")
+    p.add_argument("--split", default="train", choices=SPLITS)
+    p.add_argument("--run", required=True)
+    p.add_argument("--config", default="generate.yaml")
+    p.add_argument("--limit", type=int, help="N questions, round-robin across databases (smoke runs)")
+    p.add_argument("--db-ids")
+    p.add_argument("--shard")
+    p.add_argument("--analysis", action="store_true", help="allow dev/minidev, marked analysis-only")
+    p.set_defaults(func=cmd_generate)
+
+    p = sub.add_parser("parse", help="extract SQL, canonicalize, dedup per question (adds gold on train)")
+    p.add_argument("--split", default="train", choices=SPLITS)
+    p.add_argument("--run", required=True)
+    p.set_defaults(func=cmd_parse)
+
+    p = sub.add_parser("screen", help="execute candidates: correctness, steps, plan")
+    p.add_argument("--split", default="train", choices=SPLITS)
+    p.add_argument("--run", required=True)
+    p.add_argument("--workers", type=int)
+    p.set_defaults(func=cmd_screen)
+
+    p = sub.add_parser("diversity", help="are correct candidates at different efficiency levels?")
+    p.add_argument("--split", default="train", choices=SPLITS)
+    p.add_argument("--run", required=True)
+    p.add_argument("--round", type=int, default=0, help="0 before rewriting, r after rewrite round r")
+    p.set_defaults(func=cmd_diversity)
+
+    p = sub.add_parser("rewrite", help="[GPU] equivalent rewrites of gold for flagged train questions")
+    p.add_argument("--run", required=True)
+    p.add_argument("--round", type=int, default=1)
+    p.add_argument("--config", default="rewrite.yaml")
+    p.add_argument("--gen-config", default="generate.yaml")
+    p.add_argument("--limit", type=int, help="first N flagged questions")
+    p.set_defaults(func=cmd_rewrite)
+
+    p = sub.add_parser("build-pool", help="one Parquet/JSONL row per candidate with eff_score")
+    p.add_argument("--split", default="train", choices=SPLITS)
+    p.add_argument("--run", required=True)
+    p.set_defaults(func=cmd_build_pool)
+
+    p = sub.add_parser("verify-pool", help="[CPU runtime] step ordering vs real timing on a sample")
+    p.add_argument("--split", default="train", choices=SPLITS)
+    p.add_argument("--run", required=True)
+    p.add_argument("--sample", type=int, help="questions to time (default from pool.yaml)")
+    p.set_defaults(func=cmd_verify_pool)
+
+    p = sub.add_parser("summary", help="report for a pipeline run")
+    p.add_argument("--split", default="train", choices=SPLITS)
+    p.add_argument("--run", required=True)
+    p.set_defaults(func=cmd_summary)
+
+    p = sub.add_parser("predict", help="[GPU] greedy predictions for dev/minidev")
+    p.add_argument("--split", required=True, choices=("dev", "minidev"))
+    p.add_argument("--prompt", default="base", choices=("base", "efficient"))
+    p.add_argument("--run", required=True)
+    p.add_argument("--model", help="override the model id in generate.yaml")
+    p.add_argument("--adapter", help="LoRA adapter path (training phase)")
+    p.add_argument("--config", default="generate.yaml")
+    p.add_argument("--limit", type=int, help="N questions, round-robin across databases (smoke runs)")
+    p.set_defaults(func=cmd_predict)
+
+    p = sub.add_parser("render-prompt", help="print the prompt for one question (CPU, no tokenizer)")
+    p.add_argument("--split", required=True, choices=SPLITS)
+    p.add_argument("--qid", required=True)
+    p.add_argument("--prompt", default="base", choices=("base", "efficient"))
+    p.set_defaults(func=cmd_render_prompt)
     return parser
 
 

@@ -227,6 +227,7 @@ def evaluate(
     model: str | None = None,
     method: str | None = None,
     overwrite: bool = False,
+    only_predicted: bool = False,
     paths: Paths | None = None,
     cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -240,6 +241,11 @@ def evaluate(
     workers = workers or exec_cfg.get("workers")
 
     examples = load_examples(split, paths)[:limit] if limit else load_examples(split, paths)
+    if only_predicted:
+        # Smoke runs predict a subset; score exactly those questions (never use for reported numbers).
+        predicted = set(load_predictions(pred, examples))
+        examples = [e for e in examples if e.qid in predicted]
+        log.warning("--only-predicted: scoring %d questions that have a prediction", len(examples))
     missing_dbs = sorted({e.db_id for e in examples if not paths.local_db_path(split, e.db_id).exists()})
     if missing_dbs:
         raise RuntimeError(f"Databases not staged: {missing_dbs}. Run `effsql stage --split {split}`.")
@@ -254,7 +260,8 @@ def evaluate(
         for p in [eval_path, *run_dir.glob(f"timing_*_{split}_r*.jsonl")]:
             p.unlink(missing_ok=True)
     save_config({**cfg, "args": {"pred": pred, "split": split, "timing": timing, "repeat": repeat,
-                                 "limit": limit, "model": model, "method": method}},
+                                 "limit": limit, "model": model, "method": method,
+                                 "only_predicted": only_predicted}},
                 run_dir / f"evaluate_{split}_config.yaml")
     meta = write_run_meta(run_dir, data_files=[paths.split_file(split, "questions"), paths.split_file(split, "gold")],
                           extra={"bird_dev_release": paths.bird_dev_release, "split": split})

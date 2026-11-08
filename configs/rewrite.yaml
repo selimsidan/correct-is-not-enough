@@ -1,0 +1,20 @@
+# Rewriting fills missing efficiency levels for train questions flagged by the diversity check.
+styles:
+  optimized: "the fastest version you can write for SQLite: fewer joins, filter as early as possible, index-friendly conditions, no unnecessary sorting, DISTINCT or subqueries."
+  join_instead_of_subquery: "replace subqueries with joins wherever possible."
+  subquery_instead_of_join: "replace joins with subqueries (IN or scalar subqueries) wherever possible."
+  cte: "structure the query with common table expressions (WITH ...)."
+  exists_vs_in: "use EXISTS instead of IN, or IN instead of EXISTS, for membership tests."
+  window_function: "use window functions where they can replace self-joins, correlated subqueries or ORDER BY ... LIMIT patterns."
+  # Optional, off by default: deliberately slow queries widen the cost spread but may be unrealistic
+  # negatives for DPO.
+  # naive: "a straightforward correct query without any optimization."
+# Styles requested per question. `optimized` is always included; the rest rotate per question
+# (deterministically from the qid) so every style is used across the dataset.
+always: [optimized]
+k: 4
+# Seed queries to rewrite: gold (default) and optionally cheapest_correct (cheapest correct candidate).
+seeds: [gold]
+# Questions to rewrite: flagged (not diverse) or all.
+target: flagged
+sampling: {n: 1, temperature: 0.0, top_p: 1.0, max_tokens: 768}

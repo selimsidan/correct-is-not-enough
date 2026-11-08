@@ -4,7 +4,7 @@ Efficiency-aware text-to-SQL with small open LLMs on [BIRD](https://bird-bench.g
 CMPE 586 term project. The `effsql` package generates candidate SQL, measures correctness and cost,
 builds a candidate pool for later SFT and DPO, and evaluates predictions with EX, VES and R-VES.
 
-Status: **stage 2** (execution engine, cost, timing, official EX / VES / R-VES port, `evaluate`).
+Status: **stages 1 to 5 built** (data, measurement, generation, screening, rewriting, candidate pool, verification); smoke run pending.
 
 ## Where things live
 
@@ -48,10 +48,13 @@ Paths are set in [configs/paths.yaml](configs/paths.yaml) and two env vars:
 | Notebook | Runtime | Open |
 |---|---|---|
 | `00_setup_and_stage` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/00_setup_and_stage.ipynb) |
+| `10_pipeline` | L4 GPU (Part A), then CPU (Part B) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/10_pipeline.ipynb) |
 | `40_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/40_evaluate.ipynb) |
+| `50_analysis` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/50_analysis.ipynb) |
 
-Later stages add `10_generate` (GPU), `20_screen_and_rewrite` (CPU, then GPU), `30_build_and_verify_pool` (CPU),
-and `50_analysis` (CPU). Only LLM generation uses a GPU.
+`10_pipeline` runs the whole candidate-pool pipeline from one notebook: Part A on an L4 GPU (generate, screen,
+rewrite, build the pool, predict dev and mini-dev), Part B on a CPU runtime (verify the pool against real timing,
+evaluate, summary). `40_evaluate` scores any predictions file on its own; `50_analysis` draws the report figures.
 
 Notebooks contain no logic: the setup cell, then `!effsql ...` calls.
 
@@ -110,6 +113,37 @@ correct predictions, with a 300 s limit.
 Timing presets: `quick` (perf_counter, 1 warm-up, 5 interleaved runs, for development) and
 `official` (exact port, for reported numbers). Timing is always sequential; only the correctness and
 step-counting pass is parallel.
+
+## Pipeline (stages 3 to 5)
+
+```bash
+# Part A, L4 GPU runtime
+effsql generate --split train --run R [--limit 20]       # 2 prompts x (1 greedy + 4 samples) per question
+effsql parse --split train --run R                       # extract SQL, canonical form, dedup; gold joins the pool
+effsql screen --split train --run R                      # execute: correctness, vm_steps, plan
+effsql diversity --split train --run R --round 0         # >= 2 correct candidates at different cost levels?
+effsql rewrite --run R --round 1                         # gold rewrites for flagged questions (4 styles)
+effsql parse ... ; effsql screen ... ; effsql diversity --split train --run R --round 1
+effsql build-pool --split train --run R                  # runs/R/pool_train.parquet (+ .jsonl)
+effsql predict --split dev --prompt base --run R         # greedy predictions for evaluate
+# Part B, CPU runtime
+effsql verify-pool --split train --run R                 # step ordering vs wall-clock timing
+effsql evaluate --pred runs/R/predictions_dev_base.jsonl --split dev --run R_dev_base
+effsql summary --split train --run R
+effsql render-prompt --split dev --qid dev_0             # inspect a prompt on CPU
+```
+
+Configs: [generate.yaml](configs/generate.yaml) (model, sampling), [rewrite.yaml](configs/rewrite.yaml) (styles),
+[pool.yaml](configs/pool.yaml) (efficiency levels, step cap, verification), prompt templates in
+[configs/prompts/](configs/prompts/). Only the model's original SQL is ever executed; the sqlglot canonical form is
+just the dedup key. Rewrites are kept only when their result matches gold.
+
+### Compute and cost
+
+* GPU (L4) only for `generate`, `rewrite` and `predict`; everything else is CPU work. Part A runs its CPU steps on
+  the L4 machine to avoid switching runtimes; Part B (timing) must run on a CPU runtime.
+* Smoke run first (`LIMIT = 20` in the notebook). Every command resumes after a disconnect.
+* Disconnect and delete the GPU runtime as soon as Part A finishes: an idle L4 keeps using compute units.
 
 ## Local development
 

@@ -1,0 +1,21 @@
+# Two correct candidates are at different efficiency levels if (steps + c) differ by at least this ratio
+# AND by at least min_abs_steps (c = exec.progress_n). Tiny queries (20 vs 40 steps) are not levels.
+level_ratio: 1.5
+min_abs_steps: 50
+# A question is "diverse" with at least this many correct candidates at different levels.
+min_levels: 2
+# Counting stops at factor x max(gold_steps, 1000) steps; such candidates are recorded as censored
+# ("at least this expensive") instead of being counted to the end.
+candidate_step_cap_factor: 50
+# The train gold SQL joins the pool as a labelled candidate (source "gold").
+include_gold: true
+# Questions whose gold errors, times out or returns no rows are excluded from the pool.
+keep_bad_gold: false
+
+verify:
+  sample: 200
+  # At most this many correct candidates timed per question (cheapest, priciest and spread between).
+  max_candidates: 8
+  # Pairs where both medians are at least this are reported separately (sub-ms timings are noisy).
+  min_time_ms: 5
+  seed: 0

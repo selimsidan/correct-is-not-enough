@@ -1,0 +1,24 @@
+model:
+  # Verified on Hugging Face (public). The resolved commit sha is recorded with every record.
+  id: Qwen/Qwen2.5-Coder-7B-Instruct
+  revision: null
+  # bf16 weights (~15.2 GB) fit an L4 (24 GB) with room for KV cache; same precision we fine-tune later.
+  dtype: bfloat16
+  max_model_len: 16384
+  gpu_memory_utilization: 0.90
+  # BIRD schemas are long and shared by all questions of a database; requests are grouped by db_id.
+  enable_prefix_caching: true
+
+prompt:
+  variants: [base, efficient]
+  # Prompts above this are shortened step by step (see gen/prompts.py SHRINK_LADDER).
+  max_prompt_tokens: 12000
+
+sampling:
+  greedy: {n: 1, temperature: 0.0, top_p: 1.0, max_tokens: 512}
+  sample: {n: 4, temperature: 0.8, top_p: 0.95, max_tokens: 512}
+
+# Base seed; per-request seeds are derived from (seed, qid, variant) so samples do not depend on batching.
+seed: 0
+# (question, variant, source) requests per backend call; results are appended to disk after each.
+chunk_size: 256

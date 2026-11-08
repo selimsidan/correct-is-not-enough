@@ -1,0 +1,15 @@
+Database schema ({db_id}):
+{schema}
+
+Evidence: {evidence}
+Question: {question}
+
+Reference query (correct):
+```sql
+{seed_sql}
+```
+
+SQLite query plan of the reference query:
+{plan}
+
+Rewrite the reference query in this style. {style}: {style_instruction}
