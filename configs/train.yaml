@@ -1,0 +1,28 @@
+# Training phase. The base model (id, revision, dtype) is taken from generate.yaml so training,
+# prediction and the zero-shot baseline use exactly the same weights.
+
+export:
+  seed: 0
+  # SFT epochs; each epoch has exactly one example per train question in every SFT arm.
+  epochs: 2
+  # Whole train databases held out for validation loss (never dev or minidev).
+  val_db_fraction: 0.05
+  weighted:
+    # p proportional to 2^(beta * eff_score) = (gold_cost / cost)^beta over a question's correct candidates.
+    # 0 = uniform over correct candidates; large = best only.
+    beta: 1.0
+  tagged:
+    # Tag = eff_score clipped to [-clip, clip] and rounded to `decimals`.
+    clip: 3.0
+    decimals: 1
+    # Default test-time tag: this quantile of each train question's best eff_score.
+    inference_quantile: 0.9
+  dpo:
+    pairs_per_question: 4
+    # Share of efficiency pairs (cheaper correct over pricier correct); the rest are correct over incorrect.
+    efficiency_share: 0.5
+
+prompt:
+  # Used for training AND for predicting with fine-tuned models (`predict --max-prompt-tokens`).
+  # If this differs from generate.yaml, re-predict the zero-shot baseline with the same budget.
+  max_prompt_tokens: 12000

@@ -177,10 +177,20 @@ def cmd_render_prompt(args: argparse.Namespace) -> None:
     cfg = load_config("generate.yaml")
     ex = {e.qid: e for e in load_examples(args.split)}[args.qid]
     msgs, level, n = build_question_prompt(load_templates(), args.prompt, ex, load_schema(args.split, ex.db_id),
-                                           cfg["prompt"]["max_prompt_tokens"], estimate_tokens)
+                                           cfg["prompt"]["max_prompt_tokens"], estimate_tokens, tag=args.tag)
     for m in msgs:
         print(f"===== {m['role']} =====\n{m['content']}\n")
     print(f"(shrink level: {level}, about {n} tokens by character estimate)")
+
+
+def cmd_train_export(args: argparse.Namespace) -> None:
+    from effsql.config import load_config
+    from effsql.train.data import train_export
+
+    meta = train_export(args.pool_run, args.run, cfg=load_config(args.config),
+                        arms=args.arms.split(",") if args.arms else None, limit=args.limit, beta=args.beta)
+    print(json.dumps({k: meta[k] for k in ("n_questions", "holdout_db_ids", "inference_tag", "stats")},
+                     indent=2, default=str))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -297,8 +307,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("render-prompt", help="print the prompt for one question (CPU, no tokenizer)")
     p.add_argument("--split", required=True, choices=SPLITS)
     p.add_argument("--qid", required=True)
-    p.add_argument("--prompt", default="base", choices=("base", "efficient"))
+    p.add_argument("--prompt", default="base", choices=("base", "efficient", "tagged"))
+    p.add_argument("--tag", help="efficiency tag text for --prompt tagged, e.g. +1.5")
     p.set_defaults(func=cmd_render_prompt)
+
+    p = sub.add_parser("train-export", help="training data for the SFT arms and DPO from a train pool (CPU)")
+    p.add_argument("--pool-run", required=True, help="run holding pool_train.parquet")
+    p.add_argument("--run", required=True, help="training run name (outputs in runs/<run>/)")
+    p.add_argument("--arms", help="comma list of plain,weighted,tagged,dpo (default: all)")
+    p.add_argument("--beta", type=float, help="override export.weighted.beta (ablations)")
+    p.add_argument("--limit", type=int, help="first N questions only (smoke runs)")
+    p.add_argument("--config", default="train.yaml")
+    p.set_defaults(func=cmd_train_export)
     return parser
 
 

@@ -92,9 +92,17 @@ def fit_messages(
 
 
 def question_messages(
-    templates: dict[str, str], variant: str, db_id: str, question: str, evidence: str, schema_text: str
+    templates: dict[str, str], variant: str, db_id: str, question: str, evidence: str, schema_text: str,
+    tag: str | None = None,
 ) -> Messages:
+    """`tag` fills the {tag} placeholder of the `tagged` system prompt (efficiency-tagged SFT)."""
     system = templates[f"system_{variant}"]
+    if "{tag}" in system:
+        if tag is None:
+            raise ValueError(f"prompt variant {variant!r} needs an efficiency tag")
+        system = fill(system, {"tag": tag})
+    elif tag is not None:
+        raise ValueError(f"prompt variant {variant!r} takes no efficiency tag")
     user = fill(templates["user"], {"db_id": db_id, "schema": schema_text,
                                     "question": question, "evidence": evidence or "(none)"})
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -102,10 +110,10 @@ def question_messages(
 
 def build_question_prompt(
     templates: dict[str, str], variant: str, example: Any, schema: dict[str, Any], budget: int,
-    count_tokens: CountTokens,
+    count_tokens: CountTokens, tag: str | None = None,
 ) -> tuple[Messages, str, int]:
     return fit_messages(
-        lambda s: question_messages(templates, variant, example.db_id, example.question, example.evidence, s),
+        lambda s: question_messages(templates, variant, example.db_id, example.question, example.evidence, s, tag),
         schema, budget, count_tokens,
     )
 
