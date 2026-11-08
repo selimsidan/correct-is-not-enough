@@ -1,0 +1,13 @@
+# Reference lock for local development (Python 3.12, resolved 2026-11-08).
+# On Colab the setup cell installs from pyproject.toml and keeps Colab's preinstalled
+# numpy/pandas/pyarrow/scipy; the exact versions used by every run are recorded in
+# runs/<run>/run_meta.json. sqlglot is pinned exactly everywhere (it shapes canonical SQL).
+PyYAML==6.0.3
+numpy==2.5.4
+pandas==3.1.1
+pyarrow==26.0.1
+scipy==1.18.1
+sqlglot==30.27.0
+# dev
+pytest==9.2.0
+nbstripout==0.9.1

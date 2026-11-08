@@ -1,0 +1,12 @@
+repos:
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.9.1
+    hooks:
+      - id: nbstripout
+  - repo: local
+    hooks:
+      - id: no-long-dashes
+        name: forbid en and em dashes
+        language: pygrep
+        entry: '[\u2013\u2014]'
+        types: [text]

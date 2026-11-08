@@ -1,0 +1,10 @@
+stage:
+  # Free space kept on the local disk after staging, in GB.
+  disk_reserve_gb: 5
+  # Copy buffer for extraction from the zip on the Drive mount, in MB.
+  copy_buffer_mb: 16
+
+schema:
+  n_sample_rows: 3
+  # Sample values longer than this are truncated.
+  max_value_chars: 80

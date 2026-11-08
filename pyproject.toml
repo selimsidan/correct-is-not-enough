@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "effsql"
+version = "0.1.0"
+description = "Efficiency-aware text-to-SQL on BIRD: candidate generation, cost measurement and evaluation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Selim Sidan" }]
+dependencies = [
+    "pyyaml>=6.0",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "scipy>=1.10",
+    # Pinned exactly: the canonical SQL form depends on the sqlglot version.
+    "sqlglot==30.27.0",
+]
+
+[project.optional-dependencies]
+gen = ["vllm"]
+dev = ["pytest>=8.0", "pre-commit>=3.5", "nbstripout>=0.7"]
+
+[project.scripts]
+effsql = "effsql.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

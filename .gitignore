@@ -1,0 +1,32 @@
+# Never commit data, databases, model outputs or secrets.
+# (anchored with a leading slash so src/effsql/data/ is not ignored)
+/data/
+/bird_local/
+/runs/
+/results/
+/cache/
+/outputs/
+*.sqlite
+*.sqlite3
+*.db
+*.zip
+*.parquet
+*.jsonl
+.env
+*.token
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+
+# Notebooks and editors
+.ipynb_checkpoints/
+.DS_Store
+.vscode/
+.idea/

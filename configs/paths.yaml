@@ -1,0 +1,36 @@
+# Where data lives. All paths under `splits` are relative to drive_root.
+# drive_root and local_root are overridden by the env vars EFFSQL_DRIVE_ROOT and EFFSQL_LOCAL_ROOT.
+drive_root: /content/drive/MyDrive/586
+local_root: /content/bird_local
+# Derived outputs go to <drive_root>/<out_subdir>/{cache,runs,results}.
+out_subdir: effsql
+
+# Dev is the original 2023 BIRD release, not the revised dev set published on 2025-11-06.
+bird_dev_release: 2023-original
+
+splits:
+  train:
+    questions: train/train/train.json
+    gold: train/train/train_gold.sql
+    tables: train/train/train_tables.json
+    db_zip: train/train/train_databases.zip
+    db_split: train
+  dev:
+    questions: dev/dev.json
+    gold: dev/dev.sql
+    tables: dev/dev_tables.json
+    db_zip: dev/dev_databases.zip
+    db_split: dev
+    tied_gold: dev/dev_tied_append.json
+  minidev:
+    questions: minidev/MINIDEV/mini_dev_sqlite.json
+    gold: minidev/MINIDEV/mini_dev_sqlite_gold.sql
+    tables: minidev/MINIDEV/dev_tables.json
+    # Mini-dev (SQLite) runs on the dev databases; nothing is staged separately.
+    db_split: dev
+    # Only read by `effsql inspect` to diff against the descriptions inside the dev zip.
+    descriptions_dir: minidev/MINIDEV/dev_databases
+
+# Never read from these (relative to drive_root). The partial folder is a failed upload.
+forbidden:
+  - train/train/train_databases
