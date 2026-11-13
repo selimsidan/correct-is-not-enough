@@ -8,8 +8,11 @@ same GPU time and differ only in which targets they use:
             is best-only. In expectation this equals a loss weighted by the same probabilities.
   tagged    one correct candidate per epoch (a different one each epoch while they last), with its
             eff_score shown to the model as a tag in the prompt. At test time a high tag is asked for.
-  dpo       preference pairs: a cheaper correct candidate over a pricier one at a different
-            efficiency level, and a correct candidate over an incorrect one.
+  dpo       preference pairs of two kinds. Efficiency: two correct candidates, the chosen one at least
+            min_ratio times cheaper (and min_abs_steps fewer steps) than the rejected one, judged
+            on the pair's own costs (not on efficiency levels, whose neighbours can be almost
+            equally expensive). Correctness: a correct candidate (one of the question's cheapest)
+            over an incorrect one.
 
 Rules:
   - Only pool rows of split "train" are used; dev and minidev never enter training data.
@@ -198,6 +201,8 @@ def _pair(part: str, kind: str, q: str, ch: pd.Series, rj: pd.Series) -> dict[st
             "chosen_sql": ch["sql_original"], "rejected_sql": rj["sql_original"],
             "chosen_source": ch["source"], "rejected_source": rj["source"],
             "chosen_level": lv(ch), "rejected_level": lv(rj),
+            # rejected cost / chosen cost (smoothed steps); a lower bound when the rejected one is censored
+            "cost_ratio": None if pd.isna(rj["eff_score"]) else float(2.0 ** (ch["eff_score"] - rj["eff_score"])),
             "chosen_eff": float(ch["eff_score"]),
             "rejected_eff": None if pd.isna(rj["eff_score"]) else float(rj["eff_score"]),
             # an incorrect candidate without an error type ran fine but returned the wrong result
@@ -205,26 +210,44 @@ def _pair(part: str, kind: str, q: str, ch: pd.Series, rj: pd.Series) -> dict[st
             "export_version": EXPORT_VERSION}
 
 
-def question_pairs(g: pd.DataFrame) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+def pair_costs(g: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """(eff_score, steps) per row; steps are the counted steps or, for censored rows, the lower bound."""
+    eff = pd.to_numeric(g["eff_score"], errors="coerce").to_numpy(dtype=float)
+    steps = pd.to_numeric(g["vm_steps"], errors="coerce").fillna(pd.to_numeric(g["steps_lower_bound"], errors="coerce"))
+    return eff, steps.to_numpy(dtype=float)
+
+
+def question_pairs(g: pd.DataFrame, min_ratio: float, min_abs_steps: float) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     """All candidate pairs of one question, as (chosen, rejected) row positions in g.
-    Efficiency: chosen counted-cost correct, rejected correct at a strictly higher level.
-    Correctness: chosen counted-cost correct at the question's lowest level, rejected incorrect with
-    SQL to show (parse failures have none)."""
-    lvl = g["efficiency_level"]
+    Efficiency: chosen correct with a counted cost; rejected correct and at least min_ratio times as
+    expensive in smoothed steps (2^(eff_chosen - eff_rejected), the same smoothing as eff_score) and
+    at least min_abs_steps more. A censored rejected row qualifies on its lower bound (conservative).
+    Correctness: chosen = a counted-cost correct candidate that is not clearly pricier than the
+    question's cheapest one (same test); rejected incorrect with SQL to show (parse failures have none)."""
     ok = (g["correct"] & ~g["steps_capped"] & g["eff_score"].notna()).to_numpy()
     correct = g["correct"].to_numpy()
-    eff = [(i, j) for i in range(len(g)) for j in range(len(g))
-           if ok[i] and correct[j] and pd.notna(lvl.iloc[i]) and pd.notna(lvl.iloc[j]) and lvl.iloc[i] < lvl.iloc[j]]
-    ok_lv = lvl[ok]
-    best = [i for i in range(len(g)) if ok[i] and pd.notna(lvl.iloc[i]) and lvl.iloc[i] == ok_lv.min()]
-    wrong = [j for j in range(len(g)) if not correct[j] and g["error_type"].iloc[j] != "parse_fail"
+    eff, steps = pair_costs(g)
+    log_ratio = math.log2(min_ratio)
+
+    def apart(i: int, j: int) -> bool:  # j is clearly pricier than i
+        return bool(eff[i] - eff[j] >= log_ratio - 1e-9 and steps[j] - steps[i] >= min_abs_steps)
+
+    n = len(g)
+    eff_pairs = [(i, j) for i in range(n) for j in range(n)
+                 if ok[i] and correct[j] and not np.isnan(eff[j]) and not np.isnan(steps[j]) and apart(i, j)]
+    ok_idx = [i for i in range(n) if ok[i]]
+    best: list[int] = []
+    if ok_idx:
+        cheapest = max(ok_idx, key=lambda i: eff[i])
+        best = [i for i in ok_idx if not apart(cheapest, i)]
+    wrong = [j for j in range(n) if not correct[j] and g["error_type"].iloc[j] != "parse_fail"
              and str(g["sql_original"].iloc[j]).strip()]
     corr = [(i, j) for j in wrong for i in best]
-    return eff, corr
+    return eff_pairs, corr
 
 
 def build_dpo(pool: pd.DataFrame, qids: list[str], part: str, per_question: int, efficiency_share: float,
-              seed: int) -> list[dict[str, Any]]:
+              seed: int, min_ratio: float = 2.0, min_abs_steps: float = 50) -> list[dict[str, Any]]:
     """Up to per_question pairs per question, efficiency_share of them efficiency pairs; a type with too
     few pairs is topped up from the other. Each rejected answer is used at most once per question."""
     by_q = {q: g.sort_values("cand_id").reset_index(drop=True) for q, g in pool.groupby("qid")}
@@ -232,7 +255,7 @@ def build_dpo(pool: pd.DataFrame, qids: list[str], part: str, per_question: int,
     out = []
     for q in qids:
         g = by_q[q]
-        eff, corr = question_pairs(g)
+        eff, corr = question_pairs(g, min_ratio, min_abs_steps)
         rng = np.random.default_rng(stable_seed(seed, "dpo", q))
         eff = [eff[k] for k in rng.permutation(len(eff))]
         corr = [corr[k] for k in rng.permutation(len(corr))]
@@ -285,6 +308,8 @@ def arm_stats(arm: str, recs: list[dict[str, Any]], prompt_tokens: dict[str, int
         s["rejected_error"] = dict(Counter(str(r["rejected_error"]) for r in recs if r["pair_type"] == "correctness"))
         per_q = Counter(r["qid"] for r in recs)
         s["pairs_per_question"] = _quantiles(list(per_q.values()))
+        s["efficiency_cost_ratio"] = _quantiles([r["cost_ratio"] for r in recs
+                                                 if r["pair_type"] == "efficiency" and r["cost_ratio"] is not None])
         sql_chars = [len(r["chosen_sql"]) + len(r["rejected_sql"]) for r in recs]
     else:
         s["by_source"] = dict(Counter(r["source"] for r in recs))
@@ -342,7 +367,8 @@ def train_export(pool_run: str, run: str, *, paths: Paths | None = None, cfg: di
         if arm == "tagged":
             return build_tagged(targets, qs, part, n_ep, tc["clip"], tc["decimals"], seed)
         d = ex["dpo"]
-        return build_dpo(pool, qs, part, d["pairs_per_question"], d["efficiency_share"], seed)
+        return build_dpo(pool, qs, part, d["pairs_per_question"], d["efficiency_share"], seed,
+                         d["min_ratio"], d["min_abs_steps"])
 
     run_dir = paths.run_dir(run)
     data_dir = run_dir / "data"

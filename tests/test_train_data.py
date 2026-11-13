@@ -26,10 +26,13 @@ from effsql.train.data import (build_dpo, build_plain, build_tagged, build_weigh
 
 
 def cand(qid, cid, *, gold=False, correct=True, eff=0.0, level=0, capped=False, error=None, db="db1",
-         sql=None, split="train"):
+         sql=None, split="train", gold_steps=1000):
+    # steps consistent with eff = log2((gold + 10) / (steps + 10)); censored rows carry a lower bound
+    steps = (gold_steps + 10) / 2 ** eff - 10 if correct else None
     return {"qid": qid, "split": split, "db_id": db, "cand_id": cid, "source": "gold" if gold else "sample",
             "is_gold": gold, "sql_original": sql or f"SELECT {cid}", "correct": correct, "steps_capped": capped,
             "eff_score": eff if correct and not capped else (eff if capped else None),
+            "vm_steps": None if capped else steps, "steps_lower_bound": steps if capped else None,
             "efficiency_level": level if correct else None, "error_type": error}
 
 
@@ -104,13 +107,13 @@ def test_tagged_tags_and_no_repeats(pool):
 
 
 def test_dpo_pairs(pool):
-    eff, corr = question_pairs(pool[pool["qid"] == "train_1"].sort_values("cand_id").reset_index(drop=True))
+    eff, corr = question_pairs(pool[pool["qid"] == "train_1"].sort_values("cand_id").reset_index(drop=True), 2.0, 50)
     g = pool[pool["qid"] == "train_1"].sort_values("cand_id").reset_index(drop=True)
     ids = g["cand_id"].tolist()
     eff_ids = {(ids[i], ids[j]) for i, j in eff}
-    # chosen never censored; rejected may be censored; chosen level strictly lower
+    # chosen never censored; rejected may be censored (on its lower bound); at least 2x and 50 steps apart
     assert eff_ids == {("b", "a"), ("b", "c"), ("b", "d"), ("a", "c"), ("a", "d"), ("c", "d")}
-    # correctness: chosen = lowest level among counted correct (b); rejected = incorrect with SQL
+    # correctness: chosen = counted correct not clearly pricier than the cheapest (b); rejected = incorrect with SQL
     assert {(ids[i], ids[j]) for i, j in corr} == {("b", "e"), ("b", "g")}
 
     recs = build_dpo(pool, QIDS, "train", per_question=4, efficiency_share=0.5, seed=0)
@@ -120,15 +123,32 @@ def test_dpo_pairs(pool):
     for r in recs:
         assert r["chosen_cand"] not in {"d", "e", "f", "g", "k"}
         if r["pair_type"] == "efficiency":
-            assert r["chosen_level"] < r["rejected_level"]
+            assert r["cost_ratio"] >= 2.0
         else:
             assert r["rejected_error"] not in (None, "parse_fail")
     assert not [r for r in recs if r["qid"] == "train_2"]  # gold only: no pairs
     q3 = [r for r in recs if r["qid"] == "train_3"]
-    assert [r["pair_type"] for r in q3] == ["correctness"]  # i and j share level 0: no efficiency pair
+    assert [r["pair_type"] for r in q3] == ["correctness"]  # i and j cost about the same: no efficiency pair
     # efficiency_share 1: only 3 distinct pricier rejected (a, c, d) exist, the 4th slot is topped up
     only_eff = build_dpo(pool, ["train_1"], "train", per_question=4, efficiency_share=1.0, seed=0)
     assert Counter(r["pair_type"] for r in only_eff) == {"efficiency": 3, "correctness": 1}
+
+
+def test_efficiency_pairs_use_the_pair_cost_ratio_not_levels():
+    g = pd.DataFrame([
+        cand("train_9", "a", gold=True, eff=0.0, level=0),
+        cand("train_9", "b", eff=0.8, level=1),        # a different level but only 1.74x cheaper than a
+        cand("train_9", "c", eff=1.2, level=1),        # 2.3x cheaper than a
+        cand("train_9", "w", correct=False, error="wrong_result"),
+    ])
+    eff, corr = question_pairs(g, 2.0, 50)
+    ids = g["cand_id"].tolist()
+    assert {(ids[i], ids[j]) for i, j in eff} == {("c", "a")}
+    assert {(ids[i], ids[j]) for i, j in corr} == {("b", "w"), ("c", "w")}  # a is clearly pricier than c
+    assert {(ids[i], ids[j]) for i, j in question_pairs(g, 1.5, 50)[0]} == {("b", "a"), ("c", "a")}
+    tiny = pd.DataFrame([cand("train_8", "x", gold=True, eff=0.0, gold_steps=30),
+                         cand("train_8", "y", eff=1.5, gold_steps=30)])  # 2.8x cheaper but only 26 steps fewer
+    assert question_pairs(tiny, 2.0, 50)[0] == []
 
 
 def test_holdout_and_leakage(pool):

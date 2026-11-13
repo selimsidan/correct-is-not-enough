@@ -21,6 +21,12 @@ export:
     pairs_per_question: 4
     # Share of efficiency pairs (cheaper correct over pricier correct); the rest are correct over incorrect.
     efficiency_share: 0.5
+    # An efficiency pair needs the rejected query to cost at least min_ratio times the chosen one
+    # (smoothed steps, as in eff_score) and at least min_abs_steps more. Decided 2026-11-13: at 2x the
+    # real-time ordering agrees with the step ordering for 95% of pairs (85.6% at 1.5x, pool_v1
+    # verification), and R-VES's top reward starts at 2x faster than gold.
+    min_ratio: 2.0
+    min_abs_steps: 50
 
 prompt:
   # Used for training AND for predicting with fine-tuned models (`predict --max-prompt-tokens`).
