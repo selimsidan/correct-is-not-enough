@@ -1,0 +1,350 @@
+"""SFT with LoRA: one arm of an export, one epoch per invocation, resumable after a disconnect.
+
+Data: runs/<export>/data/<arm>_train.jsonl (the records of the requested epoch) and <arm>_val.jsonl.
+Each example is the chat prompt that prediction uses for the same question and arm (same template,
+token budget and shrink ladder: train.data.train_messages), followed by the target answer
+```sql ...``` and the end-of-turn token. Examples whose prompt exceeds the budget even at the last
+shrink level are skipped (and counted).
+
+Loss: mean cross entropy over the answer tokens only. Logits are computed only for the answer
+positions (`logits_to_keep`), so a 10k-token schema costs no vocabulary-sized activations.
+Batching: one sequence per forward pass (no padding at all) and gradient accumulation; every
+question weighs the same (per-example mean loss, averaged over the batch). A final partial batch
+is dropped.
+
+Resume: a checkpoint (LoRA weights, optimizer, scheduler, RNG, step) is written atomically to
+runs/<run>/checkpoints/ every `save_every` optimizer steps; running the same command again continues
+from the newest one. The finished adapter goes to runs/<run>/adapter/ (save_pretrained, read by vLLM)
+with adapter_meta.json. Validation loss (held-out databases) is logged every `eval_every` steps and
+at the end.
+
+Continuing (the winner's second epoch): `init_from` names a finished run whose adapter starts the new
+run; the optimizer is fresh and the learning rate is lr x continue_lr_factor.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from effsql.config import load_config, save_config
+from effsql.data.bird import load_examples
+from effsql.gen.backend import stable_seed
+from effsql.gen.prompts import load_templates
+from effsql.gen.sample import schemas_for
+from effsql.io import append_jsonl, read_json, write_json
+from effsql.paths import Paths, load_paths
+from effsql.runmeta import write_run_meta
+from effsql.train.data import read_export, target_completion, train_messages
+
+log = logging.getLogger(__name__)
+END_OF_TURN = "<|im_end|>"  # Qwen2.5 chat end of turn; vLLM stops generation on it
+SFT_VERSION = 1
+
+
+@dataclass
+class TrainExample:
+    qid: str
+    cand_id: str
+    input_ids: list[int]
+    n_target: int
+
+
+# Tokenization ---------------------------------------------------------------------------------
+def prompt_text(tok: Any, messages: list[dict[str, str]]) -> str:
+    """Exactly what the vLLM backend sends for these messages."""
+    return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def make_counter(tok: Any):
+    """Token count of the prompt, as the vLLM backend counts it (shrink-ladder decisions match)."""
+    return lambda messages: len(tok(prompt_text(tok, messages), add_special_tokens=False)["input_ids"])
+
+
+def end_token_id(tok: Any) -> int:
+    tid = tok.convert_tokens_to_ids(END_OF_TURN)
+    if tid is None or tid == getattr(tok, "unk_token_id", None):
+        raise ValueError(f"tokenizer has no {END_OF_TURN} token")
+    return int(tid)
+
+
+def build_examples(recs: list[dict[str, Any]], arm: str, tok: Any, paths: Paths, budget: int
+                   ) -> tuple[list[TrainExample], dict[str, Any]]:
+    examples = {e.qid: e for e in load_examples("train", paths)}
+    schemas = schemas_for("train", {examples[r["qid"]].db_id for r in recs}, paths)
+    templates = load_templates()
+    count, eot = make_counter(tok), end_token_id(tok)
+    out, skipped, levels = [], 0, {}
+    for r in recs:
+        e = examples[r["qid"]]
+        msgs, level, n = train_messages(templates, arm, e, schemas[e.db_id], budget, count, tag=r.get("tag_text"))
+        if n > budget:
+            skipped += 1
+            continue
+        levels[level] = levels.get(level, 0) + 1
+        prompt_ids = tok(prompt_text(tok, msgs), add_special_tokens=False)["input_ids"]
+        target_ids = tok(target_completion(r["sql"]), add_special_tokens=False)["input_ids"] + [eot]
+        out.append(TrainExample(r["qid"], r["cand_id"], prompt_ids + target_ids, len(target_ids)))
+    lens = [len(x.input_ids) for x in out]
+    stats = {"n_records": len(recs), "n_examples": len(out), "n_skipped_too_long": skipped,
+             "prompt_levels": levels, "tokens_total": int(sum(lens)),
+             "tokens_mean": float(np.mean(lens)) if lens else 0.0, "tokens_max": int(max(lens)) if lens else 0}
+    return out, stats
+
+
+# Model ----------------------------------------------------------------------------------------
+def base_model_cfg(cfg: dict[str, Any], gen_cfg: dict[str, Any]) -> dict[str, Any]:
+    """generate.yaml's model with the exact base revision of train.yaml (training and prediction)."""
+    model = dict(gen_cfg["model"])
+    if "base_revision" in cfg.get("sft", {}):
+        model["revision"] = cfg["sft"]["base_revision"]
+    return model
+
+
+def load_tokenizer(model_cfg: dict[str, Any]) -> Any:
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(model_cfg["id"], revision=model_cfg.get("revision"))
+
+
+def load_model(model_cfg: dict[str, Any], sft: dict[str, Any], device: str, init_adapter: Path | None = None) -> Any:
+    import torch
+    from peft import LoraConfig, PeftModel, get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(
+        model_cfg["id"], revision=model_cfg.get("revision"), dtype=dtype,
+        attn_implementation=sft.get("attn_implementation", "sdpa"),
+        device_map=device if device == "cuda" else None,
+    )
+    model.config.use_cache = False
+    if sft.get("gradient_checkpointing", True):
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.enable_input_require_grads()
+    if init_adapter is not None:
+        return PeftModel.from_pretrained(model, str(init_adapter), is_trainable=True)
+    lc = sft["lora"]
+    return get_peft_model(model, LoraConfig(r=lc["r"], lora_alpha=lc["alpha"], lora_dropout=lc["dropout"],
+                                            target_modules=list(lc["target_modules"]), task_type="CAUSAL_LM"))
+
+
+def example_loss(model: Any, ex: TrainExample, device: str) -> Any:
+    """Mean cross entropy over the answer tokens; logits only for the positions that predict them."""
+    import torch
+    import torch.nn.functional as F
+
+    ids = torch.tensor([ex.input_ids], device=device)
+    k = ex.n_target
+    logits = model(input_ids=ids, logits_to_keep=k + 1, use_cache=False).logits[:, :-1, :].float()
+    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), ids[:, -k:].reshape(-1))
+
+
+def val_loss(model: Any, examples: list[TrainExample], device: str) -> float | None:
+    import torch
+
+    if not examples:
+        return None
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        total = sum(float(example_loss(model, ex, device)) for ex in examples)
+    if was_training:
+        model.train()
+    return total / len(examples)
+
+
+def lr_lambda(n_steps: int, warmup: int):
+    def f(step: int) -> float:
+        if step < warmup:
+            return (step + 1) / warmup
+        return 0.5 * (1.0 + math.cos(math.pi * (step - warmup) / max(1, n_steps - warmup)))
+    return f
+
+
+# Checkpoints ----------------------------------------------------------------------------------
+def _fingerprint(arm: str, epoch: int, export_sha: str, n_steps: int, init_from: str | None) -> dict[str, Any]:
+    return {"arm": arm, "epoch": epoch, "export_pool_sha256": export_sha, "n_steps": n_steps,
+            "init_from": init_from, "sft_version": SFT_VERSION}
+
+
+def save_checkpoint(ckpt_dir: Path, step: int, model: Any, opt: Any, sched: Any, fp: dict[str, Any], keep: int) -> None:
+    import torch
+    from peft import get_peft_model_state_dict
+
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    state = {"step": step, "fingerprint": fp, "lora": get_peft_model_state_dict(model),
+             "opt": opt.state_dict(), "sched": sched.state_dict(), "torch_rng": torch.get_rng_state(),
+             "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+    final = ckpt_dir / f"step_{step:06d}.pt"
+    tmp = final.with_suffix(".pt.tmp")
+    torch.save(state, tmp)
+    tmp.replace(final)  # a disconnect mid-write never leaves a broken newest checkpoint
+    for old in sorted(ckpt_dir.glob("step_*.pt"))[:-keep]:
+        old.unlink()
+
+
+def load_latest_checkpoint(ckpt_dir: Path, model: Any, opt: Any, sched: Any, fp: dict[str, Any]) -> int:
+    import torch
+    from peft import set_peft_model_state_dict
+
+    ckpts = sorted(ckpt_dir.glob("step_*.pt")) if ckpt_dir.exists() else []
+    if not ckpts:
+        return 0
+    state = torch.load(ckpts[-1], map_location="cpu", weights_only=False)
+    if state["fingerprint"] != fp:
+        raise RuntimeError(f"{ckpts[-1]} belongs to a different training setup ({state['fingerprint']} vs {fp}); "
+                           "use a new run name")
+    set_peft_model_state_dict(model, state["lora"])
+    opt.load_state_dict(state["opt"])
+    sched.load_state_dict(state["sched"])
+    torch.set_rng_state(state["torch_rng"])
+    if state["cuda_rng"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda_rng"])
+    log.info("resumed from %s (step %d)", ckpts[-1].name, state["step"])
+    return int(state["step"])
+
+
+# Training -------------------------------------------------------------------------------------
+def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from: str | None = None,
+              paths: Paths | None = None, cfg: dict[str, Any] | None = None, gen_cfg: dict[str, Any] | None = None,
+              max_steps: int | None = None, pilot: bool = False, device: str | None = None) -> dict[str, Any]:
+    import torch
+
+    paths = paths or load_paths()
+    cfg = cfg or load_config("train.yaml")
+    gen_cfg = gen_cfg or load_config("generate.yaml")
+    sft, model_cfg = cfg["sft"], base_model_cfg(cfg, gen_cfg)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(sft["seed"])
+    export_dir = paths.run_dir(export_run, create=False)
+    emeta = read_json(export_dir / "export_meta.json")
+    run_dir = paths.run_dir(run)
+
+    tok = load_tokenizer(model_cfg)
+    budget = cfg["prompt"]["max_prompt_tokens"]
+    recs = [r for r in read_export(export_dir, arm, "train") if r["epoch"] == epoch]
+    if not recs:
+        raise RuntimeError(f"{arm}_train.jsonl has no records for epoch {epoch}")
+    train_ex, tstats = build_examples(recs, arm, tok, paths, budget)
+    val_ex, vstats = build_examples(read_export(export_dir, arm, "val"), arm, tok, paths, budget)
+    ga = sft["grad_accum"]
+    order = np.random.default_rng(stable_seed(sft["seed"], "sft", arm, epoch)).permutation(len(train_ex)).tolist()
+    if pilot:  # the longest example first: the memory peak shows up at once
+        longest = max(range(len(train_ex)), key=lambda i: len(train_ex[i].input_ids))
+        order = [longest] + [i for i in order if i != longest]
+    n_steps = len(order) // ga
+    if max_steps:
+        n_steps = min(n_steps, max_steps)
+    if n_steps == 0:
+        raise RuntimeError(f"{len(train_ex)} examples are fewer than one batch of {ga}")
+
+    init_dir = paths.run_dir(init_from, create=False) / "adapter" if init_from else None
+    model = load_model(model_cfg, sft, device, init_dir)
+    params = [p for p in model.parameters() if p.requires_grad]
+    lr = sft["lr"] * (sft.get("continue_lr_factor", 1.0) if init_from else 1.0)
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=sft.get("weight_decay", 0.0),
+                            fused=device == "cuda")
+    full_steps = len(order) // ga  # the schedule always spans the whole epoch, also for --max-steps
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda(full_steps, max(1, math.ceil(sft["warmup_ratio"] * full_steps))))
+    fp = _fingerprint(arm, epoch, emeta["pool_sha256"], full_steps, init_from)
+    ckpt_dir = run_dir / "checkpoints"
+    start = 0 if pilot else load_latest_checkpoint(ckpt_dir, model, opt, sched, fp)
+    if not pilot:
+        save_config(cfg, run_dir / "train_config.yaml")
+        write_run_meta(run_dir, extra={"command": "sft", "arm": arm, "export_run": export_run, "epoch": epoch,
+                                       "init_from": init_from, "fingerprint": fp})
+    log_path = run_dir / ("pilot_log.jsonl" if pilot else "train_log.jsonl")
+    log.info("sft %s epoch %d: %d examples (%d skipped too long), %d steps of %d, starting at %d on %s",
+             arm, epoch, len(train_ex), tstats["n_skipped_too_long"], n_steps, ga, start, device)
+
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    model.train()
+    t0, tokens, timed_tokens, t_timed = time.time(), 0, 0, None
+    last_val_step = None
+    for step in range(start, n_steps):
+        batch = order[step * ga:(step + 1) * ga]
+        loss_sum, step_tokens = 0.0, 0
+        for i in batch:
+            loss = example_loss(model, train_ex[i], device)
+            (loss / ga).backward()
+            loss_sum += loss.detach().item()
+            step_tokens += len(train_ex[i].input_ids)
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(params, sft["max_grad_norm"]))
+        opt.step()
+        sched.step()
+        opt.zero_grad(set_to_none=True)
+        tokens += step_tokens
+        now = time.time()
+        if step > start:  # the first step includes warm-up costs (kernels, allocator)
+            timed_tokens += step_tokens
+        else:
+            t_timed = now
+        rec = {"step": step + 1, "n_steps": n_steps, "loss": loss_sum / len(batch), "lr": sched.get_last_lr()[0],
+               "grad_norm": grad_norm, "tokens": step_tokens, "elapsed_s": now - t0,
+               "tokens_per_s": timed_tokens / (now - t_timed) if timed_tokens and now > t_timed else None,
+               "peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else None}
+        append_jsonl(log_path, [rec])
+        log.info("step %d/%d loss %.4f lr %.2e %.0f tok/s", step + 1, n_steps, rec["loss"], rec["lr"],
+                 rec["tokens_per_s"] or 0)
+        if pilot:
+            continue
+        if (step + 1) % sft["save_every"] == 0:
+            save_checkpoint(ckpt_dir, step + 1, model, opt, sched, fp, sft.get("keep_checkpoints", 2))
+        if (step + 1) % sft["eval_every"] == 0:
+            append_jsonl(run_dir / "val_log.jsonl", [{"step": step + 1, "val_loss": val_loss(model, val_ex, device)}])
+            last_val_step = step + 1
+
+    tok_s = timed_tokens / (time.time() - t_timed) if timed_tokens and t_timed else None
+    if pilot:
+        return pilot_report(run_dir, arm, tstats, vstats, tok_s, device, sft, len(order), ga)
+
+    final_val = val_loss(model, val_ex, device) if last_val_step != n_steps else None
+    if final_val is not None:
+        append_jsonl(run_dir / "val_log.jsonl", [{"step": n_steps, "val_loss": final_val}])
+    if n_steps % sft["save_every"]:
+        save_checkpoint(ckpt_dir, n_steps, model, opt, sched, fp, sft.get("keep_checkpoints", 2))
+    adapter = run_dir / "adapter"
+    tmp = run_dir / "adapter.tmp"
+    model.save_pretrained(str(tmp))
+    if adapter.exists():
+        import shutil
+
+        shutil.rmtree(adapter)
+    tmp.replace(adapter)
+    meta = {"arm": arm, "epoch": epoch, "export_run": export_run, "export_pool_sha256": emeta["pool_sha256"],
+            "init_from": init_from, "base_id": model_cfg["id"], "base_revision": model_cfg.get("revision"),
+            "lr": lr, "n_steps": n_steps, "grad_accum": ga, "train_examples": tstats, "val_examples": vstats,
+            "val_loss_final": final_val, "tokens_this_session": tokens, "tokens_per_s_this_session": tok_s,
+            "complete": n_steps == full_steps, "sft_version": SFT_VERSION}
+    write_json(run_dir / "adapter_meta.json", meta)
+    log.info("adapter written to %s", adapter)
+    return meta
+
+
+def pilot_report(run_dir: Path, arm: str, tstats: dict[str, Any], vstats: dict[str, Any], tok_s: float | None,
+                 device: str, sft: dict[str, Any], n_examples: int, ga: int) -> dict[str, Any]:
+    """Measured speed and memory, projected to one epoch of every SFT arm (they cost the same)."""
+    import torch
+
+    gpu = torch.cuda.get_device_name() if device == "cuda" else "cpu"
+    rate = next((v for k, v in (sft.get("units_per_hour") or {}).items() if k.lower() in gpu.lower()), None)
+    epoch_tokens = tstats["tokens_total"] * (n_examples // ga * ga) / max(n_examples, 1)
+    # validation: a forward pass costs about a third of a training step per token
+    val_tokens = vstats["tokens_total"] / 3 * (1 + (n_examples // ga) // sft["eval_every"])
+    hours = (epoch_tokens + val_tokens) / tok_s / 3600 if tok_s else None
+    rep = {"gpu": gpu, "arm": arm, "tokens_per_s": tok_s,
+           "peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else None,
+           "longest_example_tokens": tstats["tokens_max"], "epoch_tokens": int(epoch_tokens),
+           "projected_hours_per_epoch": hours, "units_per_hour": rate,
+           "projected_units_per_epoch": hours * rate if hours and rate else None,
+           "train_examples": tstats, "val_examples": vstats}
+    write_json(run_dir / f"pilot_{gpu.replace(' ', '_')}.json", rep)
+    return rep

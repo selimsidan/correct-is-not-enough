@@ -164,3 +164,13 @@ def fake_bird(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Paths:
     monkeypatch.setenv("EFFSQL_DRIVE_ROOT", str(root))
     monkeypatch.setenv("EFFSQL_LOCAL_ROOT", str(tmp_path / "local"))
     return load_paths()
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "torch: needs torch, transformers and peft (training); runs last")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Tests that load torch run last: earlier tests check that CPU commands never import torch, and a
+    module imported once stays in sys.modules for the rest of the session."""
+    items.sort(key=lambda item: item.get_closest_marker("torch") is not None)

@@ -1,8 +1,9 @@
-"""`effsql train-export`: training data for the four arms, built from a candidate pool (CPU only).
+"""`effsql train-export`: training data for the SFT arms and DPO, built from a candidate pool (CPU only).
 
-Arms. The three SFT arms have exactly one example per train question per epoch, so they cost the
+Arms. The four SFT arms have exactly one example per train question per epoch, so they cost the
 same GPU time and differ only in which targets they use:
-  plain     the gold SQL.
+  gold      the gold SQL (control: fine-tuning on BIRD without any efficiency signal).
+  best      the cheapest correct candidate of the question, from any source (gold wins ties).
   weighted  one correct candidate, drawn with probability proportional to 2^(beta * eff_score),
             i.e. (gold_cost / cost)^beta. beta = 0 is uniform over correct candidates, a large beta
             is best-only. In expectation this equals a loss weighted by the same probabilities.
@@ -17,6 +18,9 @@ same GPU time and differ only in which targets they use:
 Rules:
   - Only pool rows of split "train" are used; dev and minidev never enter training data.
   - Validation uses held-out train databases (whole databases, so no schema is shared with training).
+    Rule `typical` (default): databases of typical size whose prompt length and share of
+    questions with a much cheaper (>= 2x) correct query are closest to the whole pool, added until
+    `fraction` of the questions are held out. Rule `random`: a seeded random draw.
   - Censored candidates (steps_capped: counting stopped, the cost is only a bound) are never SFT
     targets or DPO chosen answers. They can be DPO rejected answers (they are surely expensive).
   - The quality check (effsql.pool.quality) must have run: candidates that match gold only through
@@ -48,7 +52,7 @@ from effsql.runmeta import sha256_file, write_run_meta
 
 log = logging.getLogger(__name__)
 
-SFT_ARMS = ("plain", "weighted", "tagged")
+SFT_ARMS = ("gold", "best", "weighted", "tagged")
 ARMS = SFT_ARMS + ("dpo",)
 EXPORT_VERSION = 1
 CHARS_PER_TOKEN = 3.5  # same rough rate as gen.prompts.estimate_tokens
@@ -115,6 +119,35 @@ def apply_quality(pool: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     return pool[~bad].copy(), info
 
 
+def typical_holdout_dbs(targets: pd.DataFrame, q_db: pd.Series, prompt_tokens: dict[str, int],
+                        fraction: float, much_cheaper: float = 2.0) -> list[str]:
+    """Whole databases that look like the pool as a whole, so the validation loss and validation scores
+    describe a typical slice. Candidates: databases whose question count lies between the 25th and
+    75th percentile. Score: |log(mean prompt tokens / overall mean)| + 3 * |share of questions whose
+    best correct query is >= much_cheaper x cheaper than gold - overall share|. Lowest scores are
+    added (ties by name) until `fraction` of the questions are held out."""
+    if fraction <= 0 or q_db.nunique() < 2:
+        return []
+    best = best_rows(targets[targets["qid"].isin(q_db.index)])
+    ratio = (best["gold_vm_steps"] + 10) / (pd.to_numeric(best["vm_steps"], errors="coerce") + 10)
+    q = pd.DataFrame({"db_id": q_db, "tok": q_db.index.map(lambda x: prompt_tokens.get(x, np.nan)),
+                      "cheap": (ratio >= much_cheaper).reindex(q_db.index).fillna(False).astype(float)})
+    db = q.groupby("db_id").agg(n=("tok", "size"), tok=("tok", "mean"), cheap=("cheap", "mean"))
+    lo, hi = db["n"].quantile([0.25, 0.75])
+    cand = db[(db["n"] >= lo) & (db["n"] <= hi)].copy()
+    if cand.empty:  # tiny pools: no database sits between the quartiles
+        cand = db.copy()
+    tok_term = np.abs(np.log(cand["tok"] / q["tok"].mean())).fillna(0.0) if q["tok"].notna().any() else 0.0
+    cand["score"] = tok_term + 3 * np.abs(cand["cheap"] - q["cheap"].mean())
+    held, n = [], 0
+    for row in cand.rename_axis("db").reset_index().sort_values(["score", "db"]).itertuples():
+        if n >= fraction * len(q) or len(held) >= len(db) - 1:
+            break
+        held.append(row.db)
+        n += int(row.n)
+    return sorted(held)
+
+
 def holdout_dbs(db_ids: list[str], fraction: float, seed: int) -> list[str]:
     """Whole databases held out for validation (at least one when there are two or more)."""
     dbs = sorted(set(db_ids))
@@ -152,13 +185,25 @@ def _base(arm: str, part: str, epoch: int, row: pd.Series) -> dict[str, Any]:
             "export_version": EXPORT_VERSION}
 
 
-def build_plain(targets: pd.DataFrame, qids: list[str], part: str, epochs: int) -> list[dict[str, Any]]:
+def build_gold(targets: pd.DataFrame, qids: list[str], part: str, epochs: int) -> list[dict[str, Any]]:
     by_q = {q: g for q, g in targets[targets["is_gold"]].groupby("qid")}
     out = []
     for e in range(epochs):
         for q in qids:
-            out.append(_base("plain", part, e, by_q[q].iloc[0]))
+            out.append(_base("gold", part, e, by_q[q].iloc[0]))
     return out
+
+
+def best_rows(targets: pd.DataFrame) -> pd.DataFrame:
+    """The cheapest counted correct candidate per question (fewest steps; gold first on ties, then cand_id)."""
+    t = targets.assign(_steps=pd.to_numeric(targets["vm_steps"], errors="coerce"), _not_gold=~targets["is_gold"])
+    t = t.sort_values(["qid", "_steps", "_not_gold", "cand_id"])
+    return t.groupby("qid", sort=False).head(1).drop(columns=["_steps", "_not_gold"]).set_index("qid", drop=False)
+
+
+def build_best(targets: pd.DataFrame, qids: list[str], part: str, epochs: int) -> list[dict[str, Any]]:
+    best = best_rows(targets[targets["qid"].isin(qids)])
+    return [_base("best", part, e, best.loc[q]) for e in range(epochs) for q in qids if q in best.index]
 
 
 def build_weighted(targets: pd.DataFrame, qids: list[str], part: str, epochs: int, beta: float,
@@ -354,14 +399,23 @@ def train_export(pool_run: str, run: str, *, paths: Paths | None = None, cfg: di
     targets = sft_targets(pool)
     qids = select_qids(pool, limit)
     q_db = pool.drop_duplicates("qid").set_index("qid")["db_id"]
-    held = holdout_dbs(q_db.loc[qids].tolist(), ex["val_db_fraction"], seed)
+    prompt_tokens = prompt_tokens_from_generation(paths, pool_run)
+    val = ex.get("validation", {"rule": "random", "fraction": ex.get("val_db_fraction", 0.05)})
+    if val["rule"] == "typical":
+        held = typical_holdout_dbs(targets, q_db.loc[qids], prompt_tokens, val["fraction"])
+    elif val["rule"] == "random":
+        held = holdout_dbs(q_db.loc[qids].tolist(), val["fraction"], seed)
+    else:
+        raise ValueError(f"unknown validation rule {val['rule']!r} (typical or random)")
     parts = {"train": [q for q in qids if q_db[q] not in held], "val": [q for q in qids if q_db[q] in held]}
     tc = ex["tagged"]
 
     def build(arm: str, part: str) -> list[dict[str, Any]]:
         qs, n_ep = parts[part], (epochs if part == "train" else 1)
-        if arm == "plain":
-            return build_plain(targets, qs, part, n_ep)
+        if arm == "gold":
+            return build_gold(targets, qs, part, n_ep)
+        if arm == "best":
+            return build_best(targets, qs, part, n_ep)
         if arm == "weighted":
             return build_weighted(targets, qs, part, n_ep, ex["weighted"]["beta"], seed)
         if arm == "tagged":
@@ -372,7 +426,6 @@ def train_export(pool_run: str, run: str, *, paths: Paths | None = None, cfg: di
 
     run_dir = paths.run_dir(run)
     data_dir = run_dir / "data"
-    prompt_tokens = prompt_tokens_from_generation(paths, pool_run)
     stats: dict[str, Any] = {}
     files: dict[str, str] = {}
     for arm in arms:
@@ -391,6 +444,7 @@ def train_export(pool_run: str, run: str, *, paths: Paths | None = None, cfg: di
         "export_version": EXPORT_VERSION, "arms": arms, "limit": limit, "export_cfg": ex,
         "n_questions": {k: len(v) for k, v in parts.items()},
         "holdout_db_ids": held,
+        "val_qids": parts["val"],
         "n_pool_questions": int(pool["qid"].nunique()),
         "quality_filter": quality_info,
         "inference_tag": inference_tag(targets, parts["train"], tc["inference_quantile"], tc["clip"], tc["decimals"]),

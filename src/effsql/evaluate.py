@@ -65,7 +65,7 @@ def load_predictions(pred: str, examples: list[Example]) -> dict[str, str]:
         data = json.loads(text)
     except json.JSONDecodeError:
         data = None
-    if isinstance(data, dict):
+    if isinstance(data, dict) and "qid" not in data:  # a one-line JSONL file is valid JSON too
         values = list(data.values())
         out = {}
         for e, v in zip(examples, values):
@@ -231,8 +231,12 @@ def evaluate(
     paths: Paths | None = None,
     cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if split not in ("dev", "minidev"):
-        raise ValueError("evaluate is for dev and minidev only")
+    if split not in ("dev", "minidev", "train"):
+        raise ValueError("evaluate is for dev, minidev and (validation only) train")
+    if split == "train" and (not only_predicted or timing != "none"):
+        # Train questions are scored only as the held-out validation databases of a fine-tuned model,
+        # to choose between training methods; never with timing, never as reported numbers.
+        raise ValueError("--split train needs --only-predicted and --timing none (validation predictions)")
     if timing not in TIMING_PRESETS:
         raise ValueError(f"--timing must be one of {TIMING_PRESETS}")
     paths = paths or load_paths()

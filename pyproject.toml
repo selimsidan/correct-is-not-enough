@@ -23,6 +23,9 @@ dependencies = [
 [project.optional-dependencies]
 # 0.32.0: released 2026-10-18, supports Python 3.11 to 3.14 (Colab runs 3.13), pins torch 2.13.0.
 gen = ["vllm==0.32.0"]
+# SFT with LoRA. transformers inside vLLM 0.32.0's range (>=5.16.1,<5.20.0) so training and
+# prediction share one environment; torch comes with vLLM (2.13.0).
+train = ["transformers==5.19.0", "peft==0.21.2"]
 dev = ["pytest>=8.0", "pre-commit>=3.5", "nbstripout>=0.7"]
 
 [project.scripts]

@@ -20,7 +20,7 @@ from effsql.pool.build import build_pool
 from effsql.pool.diversity import diversity
 from effsql.pool.quality import quality
 from effsql.pool.screen import screen
-from effsql.train.data import (build_dpo, build_plain, build_tagged, build_weighted, check_train_only,
+from effsql.train.data import (best_rows, build_best, build_dpo, build_gold, build_tagged, build_weighted, check_train_only,
                                format_tag, holdout_dbs, inference_tag, question_pairs, read_export, sft_targets,
                                tag_value, target_completion, train_export, train_messages, weighted_probs)
 
@@ -33,6 +33,7 @@ def cand(qid, cid, *, gold=False, correct=True, eff=0.0, level=0, capped=False, 
             "is_gold": gold, "sql_original": sql or f"SELECT {cid}", "correct": correct, "steps_capped": capped,
             "eff_score": eff if correct and not capped else (eff if capped else None),
             "vm_steps": None if capped else steps, "steps_lower_bound": steps if capped else None,
+            "gold_vm_steps": gold_steps,
             "efficiency_level": level if correct else None, "error_type": error}
 
 
@@ -73,10 +74,41 @@ def test_targets_exclude_incorrect_and_censored(pool):
     assert set(t["cand_id"]) == {"a", "b", "c", "h", "i", "j"}
 
 
-def test_plain_is_gold_one_per_question_per_epoch(pool):
-    recs = build_plain(sft_targets(pool), QIDS, "train", 2)
+def test_gold_arm_one_per_question_per_epoch(pool):
+    recs = build_gold(sft_targets(pool), QIDS, "train", 2)
     assert len(recs) == 6 and all(r["source"] == "gold" for r in recs)
     assert Counter((r["epoch"], r["qid"]) for r in recs) == {(e, q): 1 for e in (0, 1) for q in QIDS}
+
+
+def test_best_arm_takes_the_cheapest_correct_and_gold_wins_ties(pool):
+    t = sft_targets(pool)
+    recs = build_best(t, QIDS, "train", 2)
+    by_q = {(r["epoch"], r["qid"]): r["cand_id"] for r in recs}
+    assert by_q == {(e, q): c for e in (0, 1) for q, c in (("train_1", "b"), ("train_2", "h"), ("train_3", "j"))}
+    tie = pd.concat([t, pd.DataFrame([cand("train_2", "h2", eff=0.0, db="db2")])])  # same steps as gold h
+    assert best_rows(tie).loc["train_2", "cand_id"] == "h"
+
+
+def test_typical_holdout_picks_databases_like_the_pool():
+    from effsql.train.data import typical_holdout_dbs
+
+    rows, tok, q_db = [], {}, {}
+    sizes = {"tiny": 2, "a": 10, "b": 10, "c": 10, "d": 10, "huge": 60}
+    for db, n in sizes.items():
+        for k in range(n):
+            q = f"train_{db}_{k}"
+            q_db[q] = db
+            tok[q] = {"a": 1000, "b": 1100, "c": 3000, "d": 1050}.get(db, 1000)
+            rows.append(cand(q, f"{q}g", gold=True, db=db))
+            if db == "d":  # every question has a 4x cheaper correct query: unusual
+                rows.append(cand(q, f"{q}x", eff=2.0, db=db))
+    targets = sft_targets(pd.DataFrame(rows))
+    held = typical_holdout_dbs(targets, pd.Series(q_db), tok, 0.05)
+    # mean prompt length is about 1211 tokens: b (1100) is closest; d is unusual (all much cheaper),
+    # c has long prompts, tiny and huge are outside the middle sizes
+    assert held == ["b"]
+    assert typical_holdout_dbs(targets, pd.Series(q_db), tok, 0.15) == ["a", "b"]
+    assert typical_holdout_dbs(targets, pd.Series(q_db), tok, 0.0) == []
 
 
 def test_weighted_draws(pool):
@@ -175,7 +207,7 @@ EXAMPLE = SimpleNamespace(db_id="db1", question="How many rows?", evidence="")
 def test_train_prompts_match_predict_and_tag_line():
     tpl = load_templates()
     base_pred = build_question_prompt(tpl, "base", EXAMPLE, SCHEMA, 12000, estimate_tokens)
-    for arm in ("plain", "weighted"):
+    for arm in ("gold", "weighted"):
         assert train_messages(tpl, arm, EXAMPLE, SCHEMA, 12000, estimate_tokens) == base_pred
     tagged, _, _ = train_messages(tpl, "tagged", EXAMPLE, SCHEMA, 12000, estimate_tokens, tag="+1.4")
     assert tagged[1] == base_pred[0][1]  # same user message
@@ -209,11 +241,11 @@ def test_export_end_to_end(fake_bird):
     assert meta["n_questions"]["train"] + meta["n_questions"]["val"] == 3
     assert len(meta["holdout_db_ids"]) == 1  # two databases: one held out
     held = set(meta["holdout_db_ids"])
-    for arm in ("plain", "weighted", "tagged"):
+    for arm in ("gold", "best", "weighted", "tagged"):
         tr, va = read_export(rd, arm, "train"), read_export(rd, arm, "val")
         assert len(tr) == 2 * meta["n_questions"]["train"] and len(va) == meta["n_questions"]["val"]
         assert all(r["db_id"] not in held for r in tr) and all(r["db_id"] in held for r in va)
-    st = meta["stats"]["plain_train"]
+    st = meta["stats"]["gold_train"]
     assert st["prompt_tokens_coverage"] == 1.0 and st["total_tokens_estimate"] > 0
     dpo = read_export(rd, "dpo", "train") + read_export(rd, "dpo", "val")
     assert {r["pair_type"] for r in dpo} >= {"efficiency"}  # movies: count(*) vs self-join

@@ -314,7 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("train-export", help="training data for the SFT arms and DPO from a train pool (CPU)")
     p.add_argument("--pool-run", required=True, help="run holding pool_train.parquet")
     p.add_argument("--run", required=True, help="training run name (outputs in runs/<run>/)")
-    p.add_argument("--arms", help="comma list of plain,weighted,tagged,dpo (default: all)")
+    p.add_argument("--arms", help="comma list of gold,best,weighted,tagged,dpo (default: all)")
     p.add_argument("--beta", type=float, help="override export.weighted.beta (ablations)")
     p.add_argument("--limit", type=int, help="first N questions only (smoke runs)")
     p.add_argument("--config", default="train.yaml")

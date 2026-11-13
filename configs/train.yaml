@@ -3,10 +3,15 @@
 
 export:
   seed: 0
-  # SFT epochs; each epoch has exactly one example per train question in every SFT arm.
+  # SFT epochs exported; each epoch has exactly one example per train question in every SFT arm.
+  # The method comparison trains epoch 0 only; the winner continues with epoch 1.
   epochs: 2
-  # Whole train databases held out for validation loss (never dev or minidev).
-  val_db_fraction: 0.05
+  # Whole train databases held out for validation (never dev or minidev). `typical` picks databases
+  # that resemble the pool (decided 2026-11-14; on pool_v1: beer_factory, car_retails, movies_4,
+  # retail_complains); `random` is a seeded draw.
+  validation:
+    rule: typical
+    fraction: 0.05
   weighted:
     # p proportional to 2^(beta * eff_score) = (gold_cost / cost)^beta over a question's correct candidates.
     # 0 = uniform over correct candidates; large = best only.
@@ -32,3 +37,32 @@ prompt:
   # Used for training AND for predicting with fine-tuned models (`predict --max-prompt-tokens`).
   # If this differs from generate.yaml, re-predict the zero-shot baseline with the same budget.
   max_prompt_tokens: 12000
+
+sft:
+  # Exact base weights for training and for predicting with the adapters: the Hugging Face commit
+  # pool_v1 and the zero-shot baseline ran on (recorded in their generation records, 2026-11-08).
+  base_revision: c03e6d358207e414f1eca0bb1891e29f1db0e242
+  # LoRA on every linear layer of the bf16 base model (the same weights vLLM serves).
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  lr: 1.0e-4
+  # The winner's second epoch starts from its epoch-0 adapter with a fresh optimizer and lr x this.
+  continue_lr_factor: 0.5
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  # One sequence per forward pass (no padding at all) and gradient accumulation to the batch size.
+  grad_accum: 16
+  gradient_checkpointing: true
+  attn_implementation: sdpa
+  # Optimizer steps between checkpoints on Drive (resume after a Colab disconnect) and validation losses.
+  save_every: 50
+  eval_every: 250
+  keep_checkpoints: 2
+  seed: 0
+  # Approximate Colab compute units per hour, only for the pilot's cost projection (check Colab's
+  # resources panel for the current rate).
+  units_per_hour: {A100: 11.8, L4: 4.8, T4: 1.8}
