@@ -6,6 +6,8 @@ lower bound, so their eff_score is an upper bound; they are marked steps_capped.
 eff_rank: 1 = cheapest correct candidate of the question; eff_percentile: 1.0 = cheapest,
 0.0 = most expensive (1.0 when the question has a single correct candidate).
 Questions whose gold is not ok are dropped unless keep_bad_gold.
+quality: verdict of `effsql.pool.quality` for correct model candidates (ok, verified, fragile,
+unverifiable; None if the check has not run), "gold" for gold rows, None for incorrect rows.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from effsql.io import latest_by, read_jsonl
 from effsql.measure.cost import eff_score, rel_cost
 from effsql.paths import Paths, load_paths
 from effsql.pool.diversity import candidate_cost, latest_round
+from effsql.pool.quality import is_current_quality
 from effsql.pool.screen import is_current_screen, load_candidates
 
 log = logging.getLogger(__name__)
@@ -38,6 +41,8 @@ def build_pool(split: str, run: str, *, paths: Paths | None = None, pool_cfg: di
     cands = load_candidates(paths, run, split)
     screen = latest_by(run_dir / f"screen_{split}.jsonl", key="cand_id", where=is_current_screen)
     div = {r["qid"]: r for r in read_jsonl(run_dir / f"diversity_{split}_r{latest_round(paths, run, split)}.jsonl")}
+    qpath = run_dir / f"quality_{split}.jsonl"
+    qual = latest_by(qpath, key="cand_id", where=is_current_quality) if qpath.exists() else {}
 
     rows = []
     for cid, cd in cands.items():
@@ -49,6 +54,13 @@ def build_pool(split: str, run: str, *, paths: Paths | None = None, pool_cfg: di
         cost, gold_steps = candidate_cost(s), s.get("gold_vm_steps")
         has_cost = s["correct"] and cost is not None and gold_steps is not None
         plan, text = s.get("plan") or {}, s.get("text") or {}
+        q = qual.get(cid, {})
+        if cd["is_gold"]:
+            quality, qflags = "gold", None
+        elif s["correct"]:
+            quality, qflags = q.get("verdict"), ";".join(q.get("flags") or []) or None
+        else:
+            quality, qflags = None, None
         rows.append({
             "qid": cd["qid"], "split": split, "db_id": cd["db_id"], "difficulty": cd["difficulty"],
             "cand_id": cid, "source": cd["first_source"], "sources": ";".join(cd["sources"]),
@@ -65,6 +77,7 @@ def build_pool(split: str, run: str, *, paths: Paths | None = None, pool_cfg: di
             "_cost": cost if has_cost else None,
             "efficiency_level": div.get(cd["qid"], {}).get("levels", {}).get(cid),
             "question_diverse": div.get(cd["qid"], {}).get("diverse"),
+            "quality": quality, "quality_flags": qflags,
             "plan_signature": plan.get("plan_signature"),
             **{f"plan_{k}": plan.get(k) for k in PLAN_KEYS},
             **{f"text_{k}": text.get(k) for k in TEXT_KEYS},

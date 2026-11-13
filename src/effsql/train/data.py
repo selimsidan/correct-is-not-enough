@@ -16,6 +16,8 @@ Rules:
   - Validation uses held-out train databases (whole databases, so no schema is shared with training).
   - Censored candidates (steps_capped: counting stopped, the cost is only a bound) are never SFT
     targets or DPO chosen answers. They can be DPO rejected answers (they are surely expensive).
+  - The quality check (effsql.pool.quality) must have run: candidates that match gold only through
+    an arbitrary row pick (verdict fragile or unverifiable) are removed before anything is built.
   - Draws use per-question seeds, so a question's examples do not depend on which other questions
     are exported (a --limit run draws the same examples for the questions it keeps).
 
@@ -91,6 +93,23 @@ def check_train_only(pool: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"{len(bad)} pool rows are not train data (e.g. {bad['qid'].iloc[0]!r}); refusing to "
                          "build training data from them")
     return pool
+
+
+BAD_QUALITY = ("fragile", "unverifiable")  # same as effsql.pool.quality.BAD_VERDICTS
+
+
+def apply_quality(pool: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Drop candidates the quality check rejected; refuse a pool whose correct model candidates were
+    not all checked (run `python -m effsql.pool.quality`, then `effsql build-pool`)."""
+    model_correct = pool[pool["correct"] & ~pool["is_gold"]]
+    unchecked = len(model_correct) if "quality" not in pool.columns else int(model_correct["quality"].isna().sum())
+    if unchecked:
+        raise RuntimeError(f"{unchecked} correct candidates have no quality verdict. Run "
+                           "`python -m effsql.pool.quality --run <pool_run>` and then `effsql build-pool`.")
+    bad = pool["quality"].isin(BAD_QUALITY)
+    info = {"n_dropped": int(bad.sum()), "dropped_by_verdict": pool[bad]["quality"].value_counts().to_dict(),
+            "n_questions_affected": int(pool[bad]["qid"].nunique())}
+    return pool[~bad].copy(), info
 
 
 def holdout_dbs(db_ids: list[str], fraction: float, seed: int) -> list[str]:
@@ -306,7 +325,7 @@ def train_export(pool_run: str, run: str, *, paths: Paths | None = None, cfg: di
     seed, epochs = ex["seed"], ex["epochs"]
 
     pool_path = paths.run_dir(pool_run) / "pool_train.parquet"
-    pool = load_pool(paths, pool_run)
+    pool, quality_info = apply_quality(load_pool(paths, pool_run))
     targets = sft_targets(pool)
     qids = select_qids(pool, limit)
     q_db = pool.drop_duplicates("qid").set_index("qid")["db_id"]
@@ -347,6 +366,7 @@ def train_export(pool_run: str, run: str, *, paths: Paths | None = None, cfg: di
         "n_questions": {k: len(v) for k, v in parts.items()},
         "holdout_db_ids": held,
         "n_pool_questions": int(pool["qid"].nunique()),
+        "quality_filter": quality_info,
         "inference_tag": inference_tag(targets, parts["train"], tc["inference_quantile"], tc["clip"], tc["decimals"]),
         "files": files, "stats": stats,
     }

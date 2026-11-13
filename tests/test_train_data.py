@@ -18,6 +18,7 @@ from effsql.gen.sample import generate
 from effsql.io import read_json
 from effsql.pool.build import build_pool
 from effsql.pool.diversity import diversity
+from effsql.pool.quality import quality
 from effsql.pool.screen import screen
 from effsql.train.data import (build_dpo, build_plain, build_tagged, build_weighted, check_train_only,
                                format_tag, holdout_dbs, inference_tag, question_pairs, read_export, sft_targets,
@@ -180,6 +181,7 @@ def test_export_end_to_end(fake_bird):
     parse_run("train", run, paths=p)
     screen("train", run, paths=p, exec_cfg=exec_cfg)
     diversity("train", run, 0, paths=p)
+    quality("train", run, paths=p, exec_cfg=exec_cfg)
     build_pool("train", run, paths=p)
 
     meta = train_export(run, "tr", paths=p)

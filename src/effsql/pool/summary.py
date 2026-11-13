@@ -69,6 +69,7 @@ def summarize(split: str, run: str, *, paths: Paths | None = None) -> dict[str, 
             "n_correct_cheaper_than_gold_x1_5": int((pool["rel_cost"] <= 1 / 1.5).sum()),
             "potential_pairs": dpo_pair_counts(pool, pool_cfg["level_ratio"], pool_cfg["min_abs_steps"], c),
         }
+    out["quality"] = _maybe(run_dir / f"quality_stats_{split}.json")
     out["verify"] = _maybe(run_dir / f"verify_stats_{split}.json")
     evals = {}
     for p in sorted(paths.runs_dir.glob(f"{run}_*")):
