@@ -29,8 +29,9 @@ from effsql.pool.screen import screen  # noqa: E402
 from effsql.train.data import read_export, train_export, train_messages  # noqa: E402
 from effsql.train.predict_sft import predict_sft  # noqa: E402
 from effsql.train.select import mcnemar_p, select_method  # noqa: E402
-from effsql.train.sft import (END_OF_TURN, build_examples, load_tokenizer, make_counter, prompt_text,  # noqa: E402
-                              train_sft)
+from effsql.train.sft import (END_OF_TURN, TrainExample, build_examples, group_losses,  # noqa: E402
+                              load_tokenizer, make_counter, packed_len, plan_steps, prompt_text,
+                              shared_prefix_len, train_sft)
 
 TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m['role'] }}\n{{ m['content'] }}<|im_end|>\n{% endfor %}"
             "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}")
@@ -106,6 +107,57 @@ def test_examples_use_the_prediction_prompt_and_end_of_turn(setup):
     assert target.startswith("```sql\n") and target.endswith("```" + END_OF_TURN)
     _, s2 = build_examples(recs, "gold", tok, p, 50)  # a budget no prompt fits: skipped and counted
     assert s2["n_examples"] == 0 and s2["n_skipped_too_long"] == 6
+
+
+def test_group_losses_equal_losses_alone(tmp_path):
+    """A shared-prefix group gives each question exactly its loss alone, and the same gradients."""
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    path = make_tiny_model(tmp_path / "tiny")
+    model = get_peft_model(AutoModelForCausalLM.from_pretrained(str(path), dtype=torch.float32),
+                           LoraConfig(r=4, lora_alpha=8, lora_dropout=0.0, target_modules=["q_proj", "v_proj"],
+                                      task_type="CAUSAL_LM"))
+    for n, w in model.named_parameters():  # LoRA B starts at zero; make the adapter matter
+        if "lora_B" in n:
+            torch.nn.init.normal_(w, std=0.1)
+    g = torch.Generator().manual_seed(0)
+    prefix = torch.randint(0, 200, (40,), generator=g).tolist()
+    group = [TrainExample(f"q{j}", "c", prefix + torch.randint(0, 200, (n,), generator=g).tolist(), k, "db|full")
+             for j, (n, k) in enumerate([(9, 4), (15, 6), (6, 6)])]  # the last one: answer right after the prefix
+    group[1].input_ids[40] = group[0].input_ids[40]  # two questions share one token beyond the prefix
+    assert shared_prefix_len(group) == 40 and packed_len(group) == 40 + 9 + 15 + 6
+
+    def grads():
+        return {n: w.grad.clone() for n, w in model.named_parameters() if w.requires_grad}
+
+    alone = [group_losses(model, [ex], "cpu")[0] for ex in group]
+    sum(alone).backward()
+    g_alone = grads()
+    model.zero_grad()
+    packed = group_losses(model, group, "cpu")
+    sum(packed).backward()
+    g_packed = grads()
+    for a, b in zip(alone, packed):
+        assert torch.allclose(a, b, atol=1e-5)
+    assert all(torch.allclose(g_alone[n], g_packed[n], atol=1e-5) for n in g_alone)
+
+
+def test_step_plan_two_databases_per_step():
+    ex = [TrainExample(f"q{i}", "c", [i], 1, f"db{i % 5}|full") for i in range(203)]  # about 40 per database
+    steps = plan_steps(ex, 16, 8, seed=3)
+    assert len(steps) == 203 // 16 and all(sum(map(len, s)) == 16 for s in steps)
+    used = [i for s in steps for grp in s for i in grp]
+    assert len(used) == len(set(used)) == 16 * len(steps)  # every question at most once, 11 dropped
+    for s in steps:
+        for grp in s:
+            assert len({ex[i].key for i in grp}) == 1 and len(grp) <= 8
+    full = [s for s in steps if [len(grp) for grp in s] == [8, 8]]
+    assert len(full) >= 10 and all(ex[s[0][0]].key != ex[s[1][0]].key for s in full)
+    assert plan_steps(ex, 16, 8, seed=3) == steps
+    one = plan_steps(ex, 16, 1, seed=3)  # pack_size 1: one question per sequence
+    assert all(len(grp) == 1 for s in one for grp in s)
 
 
 def test_train_resume_gives_the_same_adapter(setup):

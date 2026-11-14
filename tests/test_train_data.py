@@ -210,10 +210,13 @@ def test_train_prompts_match_predict_and_tag_line():
     for arm in ("gold", "weighted"):
         assert train_messages(tpl, arm, EXAMPLE, SCHEMA, 12000, estimate_tokens) == base_pred
     tagged, _, _ = train_messages(tpl, "tagged", EXAMPLE, SCHEMA, 12000, estimate_tokens, tag="+1.4")
-    assert tagged[1] == base_pred[0][1]  # same user message
+    # the tag follows the question: the system prompt and schema are the same for every tag
+    other, _, _ = train_messages(tpl, "tagged", EXAMPLE, SCHEMA, 12000, estimate_tokens, tag="-0.3")
+    assert tagged[0] == other[0] and "+1.4" not in tagged[0]["content"]
+    assert tagged[1]["content"] == base_pred[0][1]["content"] + "\nEfficiency target: +1.4"
     b_lines, t_lines = base_pred[0][0]["content"].splitlines(), tagged[0]["content"].splitlines()
     extra = [ln for ln in t_lines if ln not in b_lines]
-    assert len(extra) == 1 and extra[0].startswith("- Efficiency target: +1.4.")
+    assert len(extra) == 1 and extra[0].startswith("- Meet the efficiency target given after the question.")
     assert [ln for ln in t_lines if ln in b_lines] == b_lines
     with pytest.raises(ValueError, match="needs an efficiency tag"):
         train_messages(tpl, "tagged", EXAMPLE, SCHEMA, 12000, estimate_tokens)

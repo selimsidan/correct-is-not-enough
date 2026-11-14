@@ -51,7 +51,7 @@ class FakeBackend:
                 style = user.rsplit("in this style. ", 1)[1].split(":", 1)[0]
                 texts = [block(REWRITES.get(style, "SELECT 1"))]
             else:
-                q = user.rsplit("Question: ", 1)[1].strip()
+                q = user.rsplit("Question: ", 1)[1].split("\n", 1)[0].strip()  # the tagged prompt adds a line after it
                 greedy, samples = SCRIPT[q]
                 texts = [greedy] if p.n == 1 else (samples + [greedy] * p.n)[: p.n]
             out.append([Completion(t, "stop", len(t) // 4) for t in texts])

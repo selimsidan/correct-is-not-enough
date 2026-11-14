@@ -54,8 +54,14 @@ sft:
   warmup_ratio: 0.03
   weight_decay: 0.0
   max_grad_norm: 1.0
-  # One sequence per forward pass (no padding at all) and gradient accumulation to the batch size.
+  # Questions per optimizer step (gradient accumulation; no padding anywhere).
   grad_accum: 16
+  # Shared-schema groups: up to pack_size questions of one database share one copy of the system
+  # prompt and schema in a sequence (each question sees only that prefix and itself, so its loss is
+  # exactly its loss alone). With grad_accum 16 a step is two groups from two databases. Decided
+  # 2026-11-14: about 6x fewer tokens than one question per sequence (A100 pilot: 41 units per epoch
+  # without groups). 1 = one question per sequence.
+  pack_size: 8
   gradient_checkpointing: true
   attn_implementation: sdpa
   # Optimizer steps between checkpoints on Drive (resume after a Colab disconnect) and validation losses.

@@ -95,17 +95,21 @@ def question_messages(
     templates: dict[str, str], variant: str, db_id: str, question: str, evidence: str, schema_text: str,
     tag: str | None = None,
 ) -> Messages:
-    """`tag` fills the {tag} placeholder of the `tagged` system prompt (efficiency-tagged SFT)."""
+    """A variant may have its own user template (`user_<variant>`). `tag` fills the {tag} placeholder
+    of the `tagged` variant (efficiency-tagged SFT); it follows the question, so every question of a
+    database shares the system prompt and the schema (shared-schema training groups)."""
     system = templates[f"system_{variant}"]
-    if "{tag}" in system:
+    user_tpl = templates.get(f"user_{variant}", templates["user"])
+    if "{tag}" in system or "{tag}" in user_tpl:
         if tag is None:
             raise ValueError(f"prompt variant {variant!r} needs an efficiency tag")
-        system = fill(system, {"tag": tag})
     elif tag is not None:
         raise ValueError(f"prompt variant {variant!r} takes no efficiency tag")
-    user = fill(templates["user"], {"db_id": db_id, "schema": schema_text,
-                                    "question": question, "evidence": evidence or "(none)"})
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    values = {"db_id": db_id, "schema": schema_text, "question": question, "evidence": evidence or "(none)"}
+    if tag is not None:
+        system = fill(system, {"tag": tag}) if "{tag}" in system else system
+        values["tag"] = tag
+    return [{"role": "system", "content": system}, {"role": "user", "content": fill(user_tpl, values)}]
 
 
 def build_question_prompt(

@@ -8,9 +8,18 @@ shrink level are skipped (and counted).
 
 Loss: mean cross entropy over the answer tokens only. Logits are computed only for the answer
 positions (`logits_to_keep`), so a 10k-token schema costs no vocabulary-sized activations.
-Batching: one sequence per forward pass (no padding at all) and gradient accumulation; every
-question weighs the same (per-example mean loss, averaged over the batch). A final partial batch
-is dropped.
+
+Shared-schema groups: the questions of one database share the system prompt and the schema, which
+are about 95% of every prompt. Up to `pack_size` questions of one database (same prompt shrink level)
+go into one sequence: the shared prefix once, then each question's own tokens (evidence, question,
+answer). An attention mask lets each question see only the prefix and itself, and its position ids
+continue from the prefix as if it were alone, so every question's loss is exactly the loss of
+training it alone. The prefix is computed once per group instead of once per question.
+
+Batching: an optimizer step has exactly `grad_accum` questions, each weighing the same (per-question
+mean loss, averaged over the step). With grad_accum 16 and pack_size 8 a step is two groups from two
+different databases (decided 2026-11-14); the last questions of each database (fewer than pack_size)
+fill the remaining steps. Steps come in a seeded random order. A final partial step is dropped.
 
 Resume: a checkpoint (LoRA weights, optimizer, scheduler, RNG, step) is written atomically to
 runs/<run>/checkpoints/ every `save_every` optimizer steps; running the same command again continues
@@ -45,7 +54,7 @@ from effsql.train.data import read_export, target_completion, train_messages
 
 log = logging.getLogger(__name__)
 END_OF_TURN = "<|im_end|>"  # Qwen2.5 chat end of turn; vLLM stops generation on it
-SFT_VERSION = 1
+SFT_VERSION = 2  # 2: shared-schema groups
 
 
 @dataclass
@@ -54,6 +63,7 @@ class TrainExample:
     cand_id: str
     input_ids: list[int]
     n_target: int
+    key: str = ""  # questions with the same key share their prompt prefix: database and shrink level
 
 
 # Tokenization ---------------------------------------------------------------------------------
@@ -90,7 +100,7 @@ def build_examples(recs: list[dict[str, Any]], arm: str, tok: Any, paths: Paths,
         levels[level] = levels.get(level, 0) + 1
         prompt_ids = tok(prompt_text(tok, msgs), add_special_tokens=False)["input_ids"]
         target_ids = tok(target_completion(r["sql"]), add_special_tokens=False)["input_ids"] + [eot]
-        out.append(TrainExample(r["qid"], r["cand_id"], prompt_ids + target_ids, len(target_ids)))
+        out.append(TrainExample(r["qid"], r["cand_id"], prompt_ids + target_ids, len(target_ids), f"{e.db_id}|{level}"))
     lens = [len(x.input_ids) for x in out]
     stats = {"n_records": len(recs), "n_examples": len(out), "n_skipped_too_long": skipped,
              "prompt_levels": levels, "tokens_total": int(sum(lens)),
@@ -135,18 +145,119 @@ def load_model(model_cfg: dict[str, Any], sft: dict[str, Any], device: str, init
                                             target_modules=list(lc["target_modules"]), task_type="CAUSAL_LM"))
 
 
-def example_loss(model: Any, ex: TrainExample, device: str) -> Any:
-    """Mean cross entropy over the answer tokens; logits only for the positions that predict them."""
+# Shared-schema groups -------------------------------------------------------------------------
+def shared_prefix_len(group: list[TrainExample]) -> int:
+    """Longest common token prefix of the group, never reaching into any answer."""
+    n = min(len(e.input_ids) - e.n_target for e in group)
+    first = np.asarray(group[0].input_ids[:n])
+    for e in group[1:]:
+        diff = np.nonzero(np.asarray(e.input_ids[:n]) != first)[0]
+        if len(diff):
+            n = int(diff[0])
+            first = first[:n]
+    return n
+
+
+def packed_len(group: list[TrainExample]) -> int:
+    p = shared_prefix_len(group)
+    return p + sum(len(e.input_ids) - p for e in group)
+
+
+def make_groups(idx: list[int], examples: list[TrainExample], size: int, rng: np.random.Generator
+                ) -> tuple[list[list[int]], list[list[int]]]:
+    """Per key: a random order cut into groups of `size`. Returns (full groups, smaller remainders)."""
+    by_key: dict[str, list[int]] = {}
+    for i in idx:
+        by_key.setdefault(examples[i].key, []).append(i)
+    full, rest = [], []
+    for k in sorted(by_key):
+        members = [by_key[k][j] for j in rng.permutation(len(by_key[k]))]
+        n_full = len(members) // size * size
+        full += [members[j:j + size] for j in range(0, n_full, size)]
+        if n_full < len(members):
+            rest.append(members[n_full:])
+    return full, rest
+
+
+def plan_steps(examples: list[TrainExample], ga: int, pack_size: int, seed: int) -> list[list[list[int]]]:
+    """Optimizer steps, each a list of groups (example indices sharing a prompt prefix) with exactly
+    `ga` questions in total. Full groups are combined so a step's groups come from different keys
+    when possible; the remainders are shuffled together and cut into steps (adjacent questions of
+    one key share a group). The order of the steps is random."""
+    rng = np.random.default_rng(seed)
+    full, rest = make_groups(list(range(len(examples))), examples, max(1, pack_size), rng)
+    per_step = ga // pack_size if pack_size > 1 and ga % pack_size == 0 else 0
+    steps: list[list[list[int]]] = []
+    if per_step:
+        pending = [full[j] for j in rng.permutation(len(full))]
+        while len(pending) >= per_step:
+            step = [pending.pop(0)]
+            while len(step) < per_step:
+                keys = {examples[g[0]].key for g in step}
+                j = next((j for j, g in enumerate(pending) if examples[g[0]].key not in keys), 0)
+                step.append(pending.pop(j))
+            steps.append(step)
+        rest += pending
+    else:
+        rest += full
+    flat = [i for j in rng.permutation(len(rest)) for i in rest[j]]
+    for s in range(0, len(flat) // ga * ga, ga):
+        chunk, groups = flat[s:s + ga], []
+        for i in chunk:
+            if groups and examples[groups[-1][0]].key == examples[i].key and len(groups[-1]) < max(1, pack_size):
+                groups[-1].append(i)
+            else:
+                groups.append([i])
+        steps.append(groups)
+    return [steps[j] for j in rng.permutation(len(steps))]
+
+
+def group_losses(model: Any, group: list[TrainExample], device: str) -> list[Any]:
+    """Per-question mean cross entropy over the answer tokens, for a group sharing a prompt prefix:
+    one forward pass over [prefix, rest of question 1, rest of question 2, ...]. Each question
+    attends only to the prefix and to itself and keeps the positions it has when alone, so each loss
+    equals the loss of that question in its own sequence."""
     import torch
     import torch.nn.functional as F
 
-    ids = torch.tensor([ex.input_ids], device=device)
-    k = ex.n_target
-    logits = model(input_ids=ids, logits_to_keep=k + 1, use_cache=False).logits[:, :-1, :].float()
-    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), ids[:, -k:].reshape(-1))
+    if len(group) == 1:
+        ex = group[0]
+        ids = torch.tensor([ex.input_ids], device=device)
+        k = ex.n_target
+        logits = model(input_ids=ids, logits_to_keep=k + 1, use_cache=False).logits[:, :-1, :].float()
+        return [F.cross_entropy(logits.reshape(-1, logits.size(-1)), ids[:, -k:].reshape(-1))]
+
+    p = shared_prefix_len(group)
+    ids, pos, seg, keep, labels, spans = list(group[0].input_ids[:p]), list(range(p)), [0] * p, [], [], []
+    for j, ex in enumerate(group, start=1):
+        start, n = len(ids), len(ex.input_ids)
+        ids += ex.input_ids[p:]
+        pos += range(p, n)
+        seg += [j] * (n - p)
+        # original position t of an answer token is predicted at t - 1; map it into the packed sequence
+        first = len(keep)
+        for t in range(n - ex.n_target, n):
+            keep.append(t - 1 if t - 1 < p else start + (t - 1 - p))
+            labels.append(ex.input_ids[t])
+        spans.append((first, len(keep)))
+    seg_t = torch.tensor(seg, device=device)
+    L = len(ids)
+    causal = torch.ones(L, L, dtype=torch.bool, device=device).tril_()
+    visible = (seg_t[None, :] == 0) | (seg_t[None, :] == seg_t[:, None])
+    mask = (causal & visible)[None, None]
+    out = model(input_ids=torch.tensor([ids], device=device), position_ids=torch.tensor([pos], device=device),
+                attention_mask=mask, logits_to_keep=torch.tensor(keep, device=device), use_cache=False)
+    logits = out.logits[0].float()
+    lab = torch.tensor(labels, device=device)
+    return [F.cross_entropy(logits[a:b], lab[a:b]) for a, b in spans]
 
 
-def val_loss(model: Any, examples: list[TrainExample], device: str) -> float | None:
+def val_groups(examples: list[TrainExample], pack_size: int, seed: int) -> list[list[int]]:
+    full, rest = make_groups(list(range(len(examples))), examples, max(1, pack_size), np.random.default_rng(seed))
+    return full + rest
+
+
+def val_loss(model: Any, examples: list[TrainExample], groups: list[list[int]], device: str) -> float | None:
     import torch
 
     if not examples:
@@ -154,10 +265,10 @@ def val_loss(model: Any, examples: list[TrainExample], device: str) -> float | N
     was_training = model.training
     model.eval()
     with torch.no_grad():
-        total = sum(float(example_loss(model, ex, device)) for ex in examples)
+        total = sum(float(x) for g in groups for x in group_losses(model, [examples[i] for i in g], device))
     if was_training:
         model.train()
-    return total / len(examples)
+    return total / sum(len(g) for g in groups)
 
 
 def lr_lambda(n_steps: int, warmup: int):
@@ -169,9 +280,10 @@ def lr_lambda(n_steps: int, warmup: int):
 
 
 # Checkpoints ----------------------------------------------------------------------------------
-def _fingerprint(arm: str, epoch: int, export_sha: str, n_steps: int, init_from: str | None) -> dict[str, Any]:
+def _fingerprint(arm: str, epoch: int, export_sha: str, n_steps: int, init_from: str | None,
+                 pack_size: int) -> dict[str, Any]:
     return {"arm": arm, "epoch": epoch, "export_pool_sha256": export_sha, "n_steps": n_steps,
-            "init_from": init_from, "sft_version": SFT_VERSION}
+            "init_from": init_from, "pack_size": pack_size, "sft_version": SFT_VERSION}
 
 
 def save_checkpoint(ckpt_dir: Path, step: int, model: Any, opt: Any, sched: Any, fp: dict[str, Any], keep: int) -> None:
@@ -234,14 +346,14 @@ def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from:
         raise RuntimeError(f"{arm}_train.jsonl has no records for epoch {epoch}")
     train_ex, tstats = build_examples(recs, arm, tok, paths, budget)
     val_ex, vstats = build_examples(read_export(export_dir, arm, "val"), arm, tok, paths, budget)
-    ga = sft["grad_accum"]
-    order = np.random.default_rng(stable_seed(sft["seed"], "sft", arm, epoch)).permutation(len(train_ex)).tolist()
-    if pilot:  # the longest example first: the memory peak shows up at once
-        longest = max(range(len(train_ex)), key=lambda i: len(train_ex[i].input_ids))
-        order = [longest] + [i for i in order if i != longest]
-    n_steps = len(order) // ga
-    if max_steps:
-        n_steps = min(n_steps, max_steps)
+    ga, pack = sft["grad_accum"], int(sft.get("pack_size", 1))
+    steps = plan_steps(train_ex, ga, pack, stable_seed(sft["seed"], "sft", arm, epoch))
+    vgroups = val_groups(val_ex, pack, sft["seed"])
+    if pilot:  # the step with the longest sequence first: the memory peak shows up at once
+        top = max(range(len(steps)), key=lambda s: max(packed_len([train_ex[i] for i in g]) for g in steps[s]))
+        steps = [steps[top]] + steps[:top] + steps[top + 1:]
+    full_steps = len(steps)  # the schedule always spans the whole epoch, also for --max-steps
+    n_steps = min(full_steps, max_steps) if max_steps else full_steps
     if n_steps == 0:
         raise RuntimeError(f"{len(train_ex)} examples are fewer than one batch of {ga}")
 
@@ -251,9 +363,8 @@ def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from:
     lr = sft["lr"] * (sft.get("continue_lr_factor", 1.0) if init_from else 1.0)
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=sft.get("weight_decay", 0.0),
                             fused=device == "cuda")
-    full_steps = len(order) // ga  # the schedule always spans the whole epoch, also for --max-steps
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda(full_steps, max(1, math.ceil(sft["warmup_ratio"] * full_steps))))
-    fp = _fingerprint(arm, epoch, emeta["pool_sha256"], full_steps, init_from)
+    fp = _fingerprint(arm, epoch, emeta["pool_sha256"], full_steps, init_from, pack)
     ckpt_dir = run_dir / "checkpoints"
     start = 0 if pilot else load_latest_checkpoint(ckpt_dir, model, opt, sched, fp)
     if not pilot:
@@ -261,8 +372,11 @@ def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from:
         write_run_meta(run_dir, extra={"command": "sft", "arm": arm, "export_run": export_run, "epoch": epoch,
                                        "init_from": init_from, "fingerprint": fp})
     log_path = run_dir / ("pilot_log.jsonl" if pilot else "train_log.jsonl")
-    log.info("sft %s epoch %d: %d examples (%d skipped too long), %d steps of %d, starting at %d on %s",
-             arm, epoch, len(train_ex), tstats["n_skipped_too_long"], n_steps, ga, start, device)
+    if pilot and log_path.exists():
+        log_path.unlink()  # a pilot is a fresh measurement
+    log.info("sft %s epoch %d: %d examples (%d skipped too long), %d steps of %d in groups of up to %d, "
+             "starting at %d on %s", arm, epoch, len(train_ex), tstats["n_skipped_too_long"], n_steps, ga, pack,
+             start, device)
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -270,13 +384,14 @@ def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from:
     t0, tokens, timed_tokens, t_timed = time.time(), 0, 0, None
     last_val_step = None
     for step in range(start, n_steps):
-        batch = order[step * ga:(step + 1) * ga]
-        loss_sum, step_tokens = 0.0, 0
-        for i in batch:
-            loss = example_loss(model, train_ex[i], device)
-            (loss / ga).backward()
-            loss_sum += loss.detach().item()
-            step_tokens += len(train_ex[i].input_ids)
+        loss_sum, step_tokens, n_q = 0.0, 0, 0
+        for g in steps[step]:
+            group = [train_ex[i] for i in g]
+            losses = group_losses(model, group, device)
+            (sum(losses) / ga).backward()
+            loss_sum += sum(x.detach().item() for x in losses)
+            step_tokens += packed_len(group)
+            n_q += len(group)
         grad_norm = float(torch.nn.utils.clip_grad_norm_(params, sft["max_grad_norm"]))
         opt.step()
         sched.step()
@@ -287,7 +402,7 @@ def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from:
             timed_tokens += step_tokens
         else:
             t_timed = now
-        rec = {"step": step + 1, "n_steps": n_steps, "loss": loss_sum / len(batch), "lr": sched.get_last_lr()[0],
+        rec = {"step": step + 1, "n_steps": n_steps, "loss": loss_sum / n_q, "n_seqs": len(steps[step]), "lr": sched.get_last_lr()[0],
                "grad_norm": grad_norm, "tokens": step_tokens, "elapsed_s": now - t0,
                "tokens_per_s": timed_tokens / (now - t_timed) if timed_tokens and now > t_timed else None,
                "peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else None}
@@ -299,14 +414,16 @@ def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from:
         if (step + 1) % sft["save_every"] == 0:
             save_checkpoint(ckpt_dir, step + 1, model, opt, sched, fp, sft.get("keep_checkpoints", 2))
         if (step + 1) % sft["eval_every"] == 0:
-            append_jsonl(run_dir / "val_log.jsonl", [{"step": step + 1, "val_loss": val_loss(model, val_ex, device)}])
+            append_jsonl(run_dir / "val_log.jsonl", [{"step": step + 1, "val_loss": val_loss(model, val_ex, vgroups, device)}])
             last_val_step = step + 1
 
     tok_s = timed_tokens / (time.time() - t_timed) if timed_tokens and t_timed else None
     if pilot:
-        return pilot_report(run_dir, arm, tstats, vstats, tok_s, device, sft, len(order), ga)
+        epoch_tokens = sum(packed_len([train_ex[i] for i in g]) for s in steps for g in s)
+        val_tokens = sum(packed_len([val_ex[i] for i in g]) for g in vgroups)
+        return pilot_report(run_dir, arm, tstats, vstats, tok_s, device, sft, epoch_tokens, val_tokens, full_steps)
 
-    final_val = val_loss(model, val_ex, device) if last_val_step != n_steps else None
+    final_val = val_loss(model, val_ex, vgroups, device) if last_val_step != n_steps else None
     if final_val is not None:
         append_jsonl(run_dir / "val_log.jsonl", [{"step": n_steps, "val_loss": final_val}])
     if n_steps % sft["save_every"]:
@@ -321,7 +438,7 @@ def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from:
     tmp.replace(adapter)
     meta = {"arm": arm, "epoch": epoch, "export_run": export_run, "export_pool_sha256": emeta["pool_sha256"],
             "init_from": init_from, "base_id": model_cfg["id"], "base_revision": model_cfg.get("revision"),
-            "lr": lr, "n_steps": n_steps, "grad_accum": ga, "train_examples": tstats, "val_examples": vstats,
+            "lr": lr, "n_steps": n_steps, "grad_accum": ga, "pack_size": pack, "train_examples": tstats, "val_examples": vstats,
             "val_loss_final": final_val, "tokens_this_session": tokens, "tokens_per_s_this_session": tok_s,
             "complete": n_steps == full_steps, "sft_version": SFT_VERSION}
     write_json(run_dir / "adapter_meta.json", meta)
@@ -330,19 +447,20 @@ def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from:
 
 
 def pilot_report(run_dir: Path, arm: str, tstats: dict[str, Any], vstats: dict[str, Any], tok_s: float | None,
-                 device: str, sft: dict[str, Any], n_examples: int, ga: int) -> dict[str, Any]:
+                 device: str, sft: dict[str, Any], epoch_tokens: int, val_tokens: int, n_steps: int) -> dict[str, Any]:
     """Measured speed and memory, projected to one epoch of every SFT arm (they cost the same)."""
     import torch
 
     gpu = torch.cuda.get_device_name() if device == "cuda" else "cpu"
     rate = next((v for k, v in (sft.get("units_per_hour") or {}).items() if k.lower() in gpu.lower()), None)
-    epoch_tokens = tstats["tokens_total"] * (n_examples // ga * ga) / max(n_examples, 1)
-    # validation: a forward pass costs about a third of a training step per token
-    val_tokens = vstats["tokens_total"] / 3 * (1 + (n_examples // ga) // sft["eval_every"])
-    hours = (epoch_tokens + val_tokens) / tok_s / 3600 if tok_s else None
+    # tokens actually processed (shared prefixes counted once); validation is a forward pass, about a
+    # third of a training step per token, at every eval_every steps and at the end
+    val_cost = val_tokens / 3 * (1 + n_steps // sft["eval_every"])
+    hours = (epoch_tokens + val_cost) / tok_s / 3600 if tok_s else None
     rep = {"gpu": gpu, "arm": arm, "tokens_per_s": tok_s,
            "peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else None,
            "longest_example_tokens": tstats["tokens_max"], "epoch_tokens": int(epoch_tokens),
+           "epoch_tokens_unshared": tstats["tokens_total"], "pack_size": sft.get("pack_size", 1),
            "projected_hours_per_epoch": hours, "units_per_hour": rate,
            "projected_units_per_epoch": hours * rate if hours and rate else None,
            "train_examples": tstats, "val_examples": vstats}
