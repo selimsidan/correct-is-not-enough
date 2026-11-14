@@ -207,6 +207,15 @@ def test_predict_and_validation_scoring(setup):
     assert {r["qid"] for r in preds} == set(meta["val_qids"]) and st["tag"] == preds[0]["tag"].strip()
     assert preds[0]["tag"].startswith(("+", "-"))
     predict_sft("gold", "dev", "R", "expv", fb, paths=p, cfg=cfg_v, limit=2)
+    with pytest.raises(RuntimeError, match="holds answers for tag"):  # never reuse answers of another tag
+        predict_sft("tagged", "val", "R", "expv", fb, paths=p, cfg=cfg_v, tag="+1.5")
+    seen = []
+    generate = fb.generate
+    fb.generate = lambda batch, params, adapters=None: (seen.extend(batch), generate(batch, params, adapters))[1]
+    predict_sft("tagged", "val", "R_tag+1.5", "expv", fb, paths=p, cfg=cfg_v, tag="+1.5")
+    raw = read_jsonl(p.run_dir("R_tag+1.5") / "predict_raw_val.jsonl")
+    assert {r["tag"] for r in raw} == {"+1.5"} and len(seen) == len(meta["val_qids"])
+    assert all(m[-1]["content"].endswith("Efficiency target: +1.5") for m in seen)
     assert len(read_jsonl(p.run_dir("R") / "predictions_dev.jsonl")) == 2
 
     ecfg = load_config("evaluate.yaml")

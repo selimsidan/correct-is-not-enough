@@ -6,6 +6,10 @@ test-time tag, by default the export's `inference_tag`). Output files match `eff
 ({qid, sql, extraction, ...} per line), so `effsql evaluate` scores them unchanged:
   runs/<run>/predictions_<split>.jsonl, predict_raw_<split>.jsonl, predict_stats_<split>.json
 `val` means the export's held-out train databases (scored with `evaluate --split train`).
+
+A run directory holds the predictions of one prompt: predicting into it again with a different tag is
+refused (its saved answers would otherwise be reused). Other tags go to their own runs
+(`python -m effsql.train predict --tags`, written to <run>_tag<tag>).
 """
 
 from __future__ import annotations
@@ -108,6 +112,11 @@ def predict_sft(arm: str, split: str, run: str, export_run: str, backend: Any, *
                                                       "prompt_tokens": n_tok}))
     run_dir = paths.run_dir(run)
     raw = run_dir / f"predict_raw_{split}.jsonl"
+    if raw.exists():
+        old = {r.get("tag") for r in latest_by(raw, key="key", where=is_current_gen).values()}
+        if old - {tag}:
+            raise RuntimeError(f"{raw} holds answers for tag {sorted(map(str, old))}, not {tag!r}: predict another "
+                               "tag into its own run (predict --tags)")
     stats = run_requests(requests, backend, raw, gen_cfg["chunk_size"], f"predict {arm} {split}")
     recs = latest_by(raw, key="key", where=is_current_gen)
     lines = []

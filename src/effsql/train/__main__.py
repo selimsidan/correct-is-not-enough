@@ -6,7 +6,7 @@
   predict   greedy predictions of a trained adapter for val, dev or minidev (GPU, vLLM)
   eval-val  score the validation predictions (CPU: correctness and step counts, no timing)
   select    the method selection rule over several trained runs
-  winner    print the selected run and arm
+  winner    print the selected run, arm and tag
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import json
 import logging
 
 from effsql.config import load_config
-from effsql.io import read_json
+from effsql.io import read_json, write_json
 from effsql.paths import load_paths
 
 
@@ -62,10 +62,23 @@ def cmd_predict(a: argparse.Namespace) -> None:
     if meta.get("base_revision") != model_cfg.get("revision"):
         raise RuntimeError(f"adapter trained on base revision {meta.get('base_revision')!r}, config has "
                            f"{model_cfg.get('revision')!r}")
+    targets = [(a.run, None)]
+    if a.tags:  # the tagged model asked for other efficiency targets, each into its own run
+        if meta["arm"] != "tagged":
+            raise ValueError(f"--tags needs a tagged model, {a.run} is {meta['arm']!r}")
+        from effsql.train.data import format_tag
+
+        targets = []
+        for t in _csv(a.tags):
+            tag = format_tag(float(t), 1)
+            out = f"{a.run}_tag{tag}"
+            write_json(paths.run_dir(out) / "adapter_meta.json", {**meta, "tag": tag, "adapter_run": a.run})
+            targets.append((out, tag))
     backend = LoRAVLLMBackend(model_cfg, paths.run_dir(a.run, create=False) / "adapter", seed=gen_cfg.get("seed", 0))
-    for split in _csv(a.splits):
-        print(json.dumps(predict_sft(meta["arm"], split, a.run, meta["export_run"], backend, gen_cfg=gen_cfg,
-                                     tag=a.tag, limit=a.limit), indent=2, default=str))
+    for out, tag in targets:
+        for split in _csv(a.splits):
+            print(json.dumps(predict_sft(meta["arm"], split, out, meta["export_run"], backend, gen_cfg=gen_cfg,
+                                         tag=tag, limit=a.limit), indent=2, default=str))
 
 
 def cmd_eval_val(a: argparse.Namespace) -> None:
@@ -74,8 +87,9 @@ def cmd_eval_val(a: argparse.Namespace) -> None:
     paths = load_paths()
     meta = read_json(paths.run_dir(a.run, create=False) / "adapter_meta.json")
     pred = paths.run_dir(a.run, create=False) / "predictions_val.jsonl"
+    tag = f"-tag{meta['tag']}" if meta.get("tag") else ""
     m = evaluate(str(pred), "train", f"{a.run}_val", only_predicted=True, model=load_config("generate.yaml")["model"]["id"],
-                 method=f"sft-{meta['arm']}-e{meta['epoch'] + 1}")
+                 method=f"sft-{meta['arm']}-e{meta['epoch'] + 1}{tag}")
     print(json.dumps({k: m["overall"].get(k) for k in ("n", "ex", "rel_cost_median", "eff_acc@1.0", "outcomes")}, indent=2))
 
 
@@ -91,8 +105,9 @@ def cmd_select(a: argparse.Namespace) -> None:
 def cmd_winner(a: argparse.Namespace) -> None:
     paths = load_paths()
     run = read_json(paths.run_dir(a.selection, create=False) / "selection.json")["winner"]
-    arm = read_json(paths.run_dir(run, create=False) / "adapter_meta.json")["arm"]
-    print(json.dumps({"run": run, "arm": arm}))
+    meta = read_json(paths.run_dir(run, create=False) / "adapter_meta.json")
+    print(json.dumps({"run": run, "arm": meta["arm"], "tag": meta.get("tag"),
+                      "adapter_run": meta.get("adapter_run", run)}))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -120,7 +135,9 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("predict")
     p.add_argument("--run", required=True)
     p.add_argument("--splits", default="val,dev,minidev")
-    p.add_argument("--tag", help="override the tagged arm's test-time tag, e.g. +1.0")
+    p.add_argument("--tags", "--tag", dest="tags",
+                   help="tagged model only: comma list of efficiency targets, e.g. +1.5,+3.0; each is predicted "
+                        "into its own run <run>_tag<tag> (default: the export's inference tag, into --run)")
     p.add_argument("--limit", type=int)
     p.add_argument("--allow-incomplete", action="store_true", help="smoke tests: adapter of a --max-steps run")
     p.set_defaults(func=cmd_predict)
