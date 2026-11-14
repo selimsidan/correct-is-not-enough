@@ -9,11 +9,12 @@ same GPU time and differ only in which targets they use:
             is best-only. In expectation this equals a loss weighted by the same probabilities.
   tagged    one correct candidate per epoch (a different one each epoch while they last), with its
             eff_score shown to the model as a tag in the prompt. At test time a high tag is asked for.
-  dpo       preference pairs of two kinds. Efficiency: two correct candidates, the chosen one at least
-            min_ratio times cheaper (and min_abs_steps fewer steps) than the rejected one, judged
-            on the pair's own costs (not on efficiency levels, whose neighbours can be almost
-            equally expensive). Correctness: a correct candidate (one of the question's cheapest)
-            over an incorrect one.
+  dpo       preference pairs, only for questions with at least one efficiency pair. Efficiency: two
+            correct candidates, the chosen one at least min_ratio times cheaper (and min_abs_steps
+            fewer steps) than the rejected one, judged on the pair's own costs (not on efficiency
+            levels, whose neighbours can be almost equally expensive); up to efficiency_pairs per
+            question. Correctness: a correct candidate (one of the question's cheapest) over an
+            incorrect one; up to correctness_pairs per question, so cheaper never wins over correct.
 
 Rules:
   - Only pool rows of split "train" are used; dev and minidev never enter training data.
@@ -291,16 +292,18 @@ def question_pairs(g: pd.DataFrame, min_ratio: float, min_abs_steps: float) -> t
     return eff_pairs, corr
 
 
-def build_dpo(pool: pd.DataFrame, qids: list[str], part: str, per_question: int, efficiency_share: float,
+def build_dpo(pool: pd.DataFrame, qids: list[str], part: str, efficiency_pairs: int, correctness_pairs: int,
               seed: int, min_ratio: float = 2.0, min_abs_steps: float = 50) -> list[dict[str, Any]]:
-    """Up to per_question pairs per question, efficiency_share of them efficiency pairs; a type with too
-    few pairs is topped up from the other. Each rejected answer is used at most once per question."""
+    """Per question with at least one efficiency pair: up to `efficiency_pairs` efficiency pairs, then up to
+    `correctness_pairs` correctness pairs (decided 2026-11-13: 4 and 1). Each rejected answer is used at
+    most once per question; pairs are drawn with a per-question seed."""
     by_q = {q: g.sort_values("cand_id").reset_index(drop=True) for q, g in pool.groupby("qid")}
-    n_eff_target = round(per_question * efficiency_share)
     out = []
     for q in qids:
         g = by_q[q]
         eff, corr = question_pairs(g, min_ratio, min_abs_steps)
+        if not eff:
+            continue
         rng = np.random.default_rng(stable_seed(seed, "dpo", q))
         eff = [eff[k] for k in rng.permutation(len(eff))]
         corr = [corr[k] for k in rng.permutation(len(corr))]
@@ -308,16 +311,17 @@ def build_dpo(pool: pd.DataFrame, qids: list[str], part: str, per_question: int,
         used_rej: set[int] = set()
 
         def take(cands: list[tuple[int, int]], kind: str, n: int) -> None:
+            k = 0
             for c, r in cands:
-                if len([1 for k, _ in picked if k == kind]) >= n or len(picked) >= per_question:
+                if k >= n:
                     return
                 if r not in used_rej:
                     used_rej.add(r)
                     picked.append((kind, (c, r)))
+                    k += 1
 
-        take(eff, "efficiency", n_eff_target)
-        take(corr, "correctness", per_question - len(picked))
-        take(eff, "efficiency", per_question)  # top up when correctness pairs ran out
+        take(eff, "efficiency", efficiency_pairs)
+        take(corr, "correctness", correctness_pairs)
         out += [_pair(part, kind, q, g.iloc[c], g.iloc[r]) for kind, (c, r) in picked]
     return out
 
@@ -421,7 +425,7 @@ def train_export(pool_run: str, run: str, *, paths: Paths | None = None, cfg: di
         if arm == "tagged":
             return build_tagged(targets, qs, part, n_ep, tc["clip"], tc["decimals"], seed)
         d = ex["dpo"]
-        return build_dpo(pool, qs, part, d["pairs_per_question"], d["efficiency_share"], seed,
+        return build_dpo(pool, qs, part, d["efficiency_pairs"], d["correctness_pairs"], seed,
                          d["min_ratio"], d["min_abs_steps"])
 
     run_dir = paths.run_dir(run)

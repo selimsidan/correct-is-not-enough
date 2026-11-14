@@ -148,9 +148,11 @@ def test_dpo_pairs(pool):
     # correctness: chosen = counted correct not clearly pricier than the cheapest (b); rejected = incorrect with SQL
     assert {(ids[i], ids[j]) for i, j in corr} == {("b", "e"), ("b", "g")}
 
-    recs = build_dpo(pool, QIDS, "train", per_question=4, efficiency_share=0.5, seed=0)
+    recs = build_dpo(pool, QIDS, "train", efficiency_pairs=4, correctness_pairs=1, seed=0)
     q1 = [r for r in recs if r["qid"] == "train_1"]
-    assert len(q1) == 4 and Counter(r["pair_type"] for r in q1) == {"efficiency": 2, "correctness": 2}
+    # only 3 distinct pricier rejected (a, c, d) exist: 3 efficiency pairs, then 1 correctness pair
+    assert Counter(r["pair_type"] for r in q1) == {"efficiency": 3, "correctness": 1}
+    assert [r["pair_type"] for r in q1] == ["efficiency"] * 3 + ["correctness"]
     assert len({r["rejected_cand"] for r in q1}) == 4  # each rejected answer used once
     for r in recs:
         assert r["chosen_cand"] not in {"d", "e", "f", "g", "k"}
@@ -158,12 +160,10 @@ def test_dpo_pairs(pool):
             assert r["cost_ratio"] >= 2.0
         else:
             assert r["rejected_error"] not in (None, "parse_fail")
-    assert not [r for r in recs if r["qid"] == "train_2"]  # gold only: no pairs
-    q3 = [r for r in recs if r["qid"] == "train_3"]
-    assert [r["pair_type"] for r in q3] == ["correctness"]  # i and j cost about the same: no efficiency pair
-    # efficiency_share 1: only 3 distinct pricier rejected (a, c, d) exist, the 4th slot is topped up
-    only_eff = build_dpo(pool, ["train_1"], "train", per_question=4, efficiency_share=1.0, seed=0)
-    assert Counter(r["pair_type"] for r in only_eff) == {"efficiency": 3, "correctness": 1}
+    # train_2 (gold only) and train_3 (i and j cost about the same): no efficiency pair, so no pairs at all
+    assert {r["qid"] for r in recs} == {"train_1"}
+    two = build_dpo(pool, ["train_1"], "train", efficiency_pairs=2, correctness_pairs=0, seed=0)
+    assert [r["pair_type"] for r in two] == ["efficiency"] * 2
 
 
 def test_efficiency_pairs_use_the_pair_cost_ratio_not_levels():

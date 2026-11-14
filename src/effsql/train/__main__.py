@@ -3,6 +3,7 @@
   export    training data for every arm from a quality-checked pool (CPU, minutes)
   pilot     a few training steps on the current GPU: speed, memory, projected hours and units
   sft       train one arm for one epoch (resumable: rerun the same command after a disconnect)
+  dpo       DPO from a finished SFT adapter on the export's preference pairs (resumable)
   predict   greedy predictions of a trained adapter for val, dev or minidev (GPU, vLLM)
   eval-val  score the validation predictions (CPU: correctness and step counts, no timing)
   select    the method selection rule over several trained runs
@@ -48,6 +49,14 @@ def cmd_sft(a: argparse.Namespace) -> None:
                                            "tokens_per_s_this_session")}, indent=2, default=str))
 
 
+def cmd_dpo(a: argparse.Namespace) -> None:
+    from effsql.train.dpo import train_dpo
+
+    meta = train_dpo(a.export, a.run, a.init_from, tag=a.tag, max_steps=a.max_steps)
+    print(json.dumps({k: meta[k] for k in ("arm", "tag", "init_from", "n_steps", "complete", "val_final")},
+                     indent=2, default=str))
+
+
 def cmd_predict(a: argparse.Namespace) -> None:
     from effsql.train.predict_sft import LoRAVLLMBackend, predict_sft
 
@@ -62,7 +71,8 @@ def cmd_predict(a: argparse.Namespace) -> None:
     if meta.get("base_revision") != model_cfg.get("revision"):
         raise RuntimeError(f"adapter trained on base revision {meta.get('base_revision')!r}, config has "
                            f"{model_cfg.get('revision')!r}")
-    targets = [(a.run, None)]
+    adapter_run = meta.get("adapter_run", a.run)  # tag-sweep runs share their model's adapter
+    targets = [(a.run, meta.get("tag"))]  # a DPO or tag-sweep run predicts with its own tag
     if a.tags:  # the tagged model asked for other efficiency targets, each into its own run
         if meta["arm"] != "tagged":
             raise ValueError(f"--tags needs a tagged model, {a.run} is {meta['arm']!r}")
@@ -72,9 +82,9 @@ def cmd_predict(a: argparse.Namespace) -> None:
         for t in _csv(a.tags):
             tag = format_tag(float(t), 1)
             out = f"{a.run}_tag{tag}"
-            write_json(paths.run_dir(out) / "adapter_meta.json", {**meta, "tag": tag, "adapter_run": a.run})
+            write_json(paths.run_dir(out) / "adapter_meta.json", {**meta, "tag": tag, "adapter_run": adapter_run})
             targets.append((out, tag))
-    backend = LoRAVLLMBackend(model_cfg, paths.run_dir(a.run, create=False) / "adapter", seed=gen_cfg.get("seed", 0))
+    backend = LoRAVLLMBackend(model_cfg, paths.run_dir(adapter_run, create=False) / "adapter", seed=gen_cfg.get("seed", 0))
     for out, tag in targets:
         for split in _csv(a.splits):
             print(json.dumps(predict_sft(meta["arm"], split, out, meta["export_run"], backend, gen_cfg=gen_cfg,
@@ -89,7 +99,7 @@ def cmd_eval_val(a: argparse.Namespace) -> None:
     pred = paths.run_dir(a.run, create=False) / "predictions_val.jsonl"
     tag = f"-tag{meta['tag']}" if meta.get("tag") else ""
     m = evaluate(str(pred), "train", f"{a.run}_val", only_predicted=True, model=load_config("generate.yaml")["model"]["id"],
-                 method=f"sft-{meta['arm']}-e{meta['epoch'] + 1}{tag}")
+                 method=f"{meta.get('method', 'sft-' + meta['arm'])}-e{meta['epoch'] + 1}{tag}")
     print(json.dumps({k: m["overall"].get(k) for k in ("n", "ex", "rel_cost_median", "eff_acc@1.0", "outcomes")}, indent=2))
 
 
@@ -132,12 +142,20 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--init-from", help="finished run whose adapter starts this one (second epoch)")
     p.add_argument("--max-steps", type=int, help="stop early (smoke tests only)")
     p.set_defaults(func=cmd_sft)
+    p = sub.add_parser("dpo")
+    p.add_argument("--export", required=True, help="export run holding dpo_train.jsonl and dpo_val.jsonl")
+    p.add_argument("--run", required=True)
+    p.add_argument("--init-from", required=True, help="finished SFT run whose adapter starts DPO (and is the reference)")
+    p.add_argument("--tag", help="tagged model: the efficiency target in every prompt (e.g. +1.5)")
+    p.add_argument("--max-steps", type=int, help="stop early (smoke tests only)")
+    p.set_defaults(func=cmd_dpo)
     p = sub.add_parser("predict")
     p.add_argument("--run", required=True)
     p.add_argument("--splits", default="val,dev,minidev")
     p.add_argument("--tags", "--tag", dest="tags",
                    help="tagged model only: comma list of efficiency targets, e.g. +1.5,+3.0; each is predicted "
-                        "into its own run <run>_tag<tag> (default: the export's inference tag, into --run)")
+                        "into its own run <run>_tag<tag> (default: the run's own tag if it has one, else the export's "
+                        "inference tag, into --run)")
     p.add_argument("--limit", type=int)
     p.add_argument("--allow-incomplete", action="store_true", help="smoke tests: adapter of a --max-steps run")
     p.set_defaults(func=cmd_predict)

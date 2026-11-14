@@ -23,9 +23,12 @@ export:
     # Default test-time tag: this quantile of each train question's best eff_score.
     inference_quantile: 0.9
   dpo:
-    pairs_per_question: 4
-    # Share of efficiency pairs (cheaper correct over pricier correct); the rest are correct over incorrect.
-    efficiency_share: 0.5
+    # Only questions with at least one efficiency pair (decided 2026-11-13). Per question: up to
+    # efficiency_pairs pairs of a cheaper correct over a pricier correct answer, plus up to
+    # correctness_pairs of a cheapest correct over an incorrect answer (keeps correctness in the signal).
+    # On pool_v1: 2,210 train questions, 3,457 efficiency and 1,263 correctness pairs.
+    efficiency_pairs: 4
+    correctness_pairs: 1
     # An efficiency pair needs the rejected query to cost at least min_ratio times the chosen one
     # (smoothed steps, as in eff_score) and at least min_abs_steps more. Decided 2026-11-13: at 2x the
     # real-time ordering agrees with the step ordering for 95% of pairs (85.6% at 1.5x, pool_v1
@@ -75,3 +78,23 @@ sft:
   # Approximate Colab compute units per hour, only for the pilot's cost projection (check Colab's
   # resources panel for the current rate).
   units_per_hour: {A100: 11.8, L4: 4.8, T4: 1.8}
+
+dpo:
+  # DPO with an NLL term on the chosen answer ("RPO"), from the kept SFT adapter (LoRA settings,
+  # gradient checkpointing, clipping and the GPU check come from `sft`). Defaults set 2026-11-15.
+  # Pairwise preference strength: higher keeps the model closer to the SFT model.
+  beta: 0.1
+  # Weight of the chosen answer's mean token cross entropy: keeps the chosen (correct) answers likely,
+  # so the preference term cannot win by making both answers unlikely.
+  rpo_alpha: 1.0
+  lr: 1.0e-5
+  warmup_ratio: 0.1
+  epochs: 1
+  # Questions per optimizer step, in shared-schema groups of pack_size questions (as in SFT). A group is
+  # cut into sequences of at most max_answers_per_seq answers (whole questions).
+  questions_per_step: 16
+  pack_size: 8
+  max_answers_per_seq: 16
+  save_every: 25
+  eval_every: 50
+  seed: 0

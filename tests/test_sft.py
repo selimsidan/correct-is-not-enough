@@ -211,7 +211,7 @@ def test_predict_and_validation_scoring(setup):
         predict_sft("tagged", "val", "R", "expv", fb, paths=p, cfg=cfg_v, tag="+1.5")
     seen = []
     generate = fb.generate
-    fb.generate = lambda batch, params, adapters=None: (seen.extend(batch), generate(batch, params, adapters))[1]
+    fb.generate = lambda batch, params, *rest: (seen.extend(batch), generate(batch, params, *rest))[1]
     predict_sft("tagged", "val", "R_tag+1.5", "expv", fb, paths=p, cfg=cfg_v, tag="+1.5")
     raw = read_jsonl(p.run_dir("R_tag+1.5") / "predict_raw_val.jsonl")
     assert {r["tag"] for r in raw} == {"+1.5"} and len(seen) == len(meta["val_qids"])
@@ -251,3 +251,51 @@ def test_cli_parses(tmp_path):
     with pytest.raises(SystemExit):
         main(["--help"])
     assert read_json  # module imports cleanly
+
+
+def test_dpo_loss_and_sequences():
+    import math
+
+    import torch
+
+    from effsql.train.dpo import Unit, dpo_terms, seqs
+
+    nll = torch.tensor(0.5)
+    loss, m = dpo_terms(torch.tensor(-3.0), torch.tensor(-5.0), -3.0, -5.0, nll, beta=0.1, rpo_alpha=1.0)
+    assert float(m) == 0.0 and float(loss) == pytest.approx(math.log(2) + 0.5)  # policy == reference
+    loss2, m2 = dpo_terms(torch.tensor(-2.0), torch.tensor(-6.0), -3.0, -5.0, nll, beta=0.1, rpo_alpha=0.0)
+    assert float(m2) == pytest.approx(0.2) and float(loss2) < math.log(2)  # chosen up, rejected down
+    units = [Unit(f"q{i}", "db|full", list(range(n))) for i, n in enumerate([5, 6, 7, 20])]
+    assert [[u.qid for u in s] for s in seqs(units, 12)] == [["q0", "q1"], ["q2"], ["q3"]]  # whole questions
+
+
+def test_dpo_trains_resumes_and_predicts(setup):
+    import torch
+
+    from effsql.train.dpo import train_dpo
+
+    p, cfg, gen_cfg = setup
+    train_sft("gold", "exp", "S", paths=p, cfg=cfg, gen_cfg=gen_cfg, device="cpu")
+    cfg["dpo"].update(questions_per_step=1, pack_size=1, save_every=1, eval_every=100, epochs=2)
+    pairs = read_export(p.run_dir("exp"), "dpo", "train")
+    assert {r["pair_type"] for r in pairs} >= {"efficiency"}
+    n_q = len({r["qid"] for r in pairs})
+    meta = train_dpo("exp", "D", "S", paths=p, cfg=cfg, gen_cfg=gen_cfg, device="cpu")
+    assert meta["complete"] and meta["n_steps"] == 2 * n_q and meta["arm"] == "gold" and meta["tag"] is None
+    assert meta["method"] == "dpo-gold" and meta["train_pairs"]["n_pairs"] == len(pairs)
+    ref = read_jsonl(p.run_dir("D") / "ref_logps.jsonl")
+    answers = {(r["qid"], r[f"{s}_cand"]) for r in pairs for s in ("chosen", "rejected")}
+    assert {(r["qid"], r["cand_id"]) for r in ref} == answers and all(r["logp"] < 0 for r in ref)
+    log = read_jsonl(p.run_dir("D") / "train_log.jsonl")
+    assert [r["step"] for r in log] == list(range(1, 2 * n_q + 1)) and all(r["loss"] > 0 for r in log)
+    a = adapter_weights(p.run_dir("D"))
+    assert any(not torch.allclose(a[k], adapter_weights(p.run_dir("S"))[k]) for k in a)  # DPO moved the adapter
+
+    part = train_dpo("exp", "D2", "S", paths=p, cfg=cfg, gen_cfg=gen_cfg, device="cpu", max_steps=1)
+    assert not part["complete"]
+    train_dpo("exp", "D2", "S", paths=p, cfg=cfg, gen_cfg=gen_cfg, device="cpu")  # resumes; reference reused
+    assert len(read_jsonl(p.run_dir("D2") / "ref_logps.jsonl")) == len(answers)
+    b = adapter_weights(p.run_dir("D2"))
+    assert all(torch.allclose(a[k], b[k]) for k in a)
+    with pytest.raises(RuntimeError, match="different training setup"):
+        train_dpo("exp", "D", "S", paths=p, cfg={**cfg, "dpo": {**cfg["dpo"], "beta": 0.5}}, gen_cfg=gen_cfg, device="cpu")
