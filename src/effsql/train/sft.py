@@ -324,6 +324,21 @@ def load_latest_checkpoint(ckpt_dir: Path, model: Any, opt: Any, sched: Any, fp:
 
 
 # Training -------------------------------------------------------------------------------------
+def check_gpu(device: str, sft: dict[str, Any]) -> str:
+    """Stop before any download when the GPU is too small for the longest training sequence."""
+    import torch
+
+    if device != "cuda":
+        return device
+    name = torch.cuda.get_device_name()
+    total = torch.cuda.get_device_properties(0).total_memory / 2**30
+    need = sft.get("min_gpu_memory_gb")
+    if need and total < need:
+        raise RuntimeError(f"this runtime's GPU ({name}, {total:.1f} GiB) is too small: training needs at least "
+                           f"{need} GiB (an A100 40 GB). Change the runtime type to A100 and run the notebook again.")
+    return f"{name} ({total:.1f} GiB)"
+
+
 def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from: str | None = None,
               paths: Paths | None = None, cfg: dict[str, Any] | None = None, gen_cfg: dict[str, Any] | None = None,
               max_steps: int | None = None, pilot: bool = False, device: str | None = None) -> dict[str, Any]:
@@ -334,6 +349,7 @@ def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from:
     gen_cfg = gen_cfg or load_config("generate.yaml")
     sft, model_cfg = cfg["sft"], base_model_cfg(cfg, gen_cfg)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    gpu = check_gpu(device, sft)
     torch.manual_seed(sft["seed"])
     export_dir = paths.run_dir(export_run, create=False)
     emeta = read_json(export_dir / "export_meta.json")
@@ -369,7 +385,7 @@ def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from:
     start = 0 if pilot else load_latest_checkpoint(ckpt_dir, model, opt, sched, fp)
     if not pilot:
         save_config(cfg, run_dir / "train_config.yaml")
-        write_run_meta(run_dir, extra={"command": "sft", "arm": arm, "export_run": export_run, "epoch": epoch,
+        write_run_meta(run_dir, extra={"command": "sft", "gpu": gpu, "arm": arm, "export_run": export_run, "epoch": epoch,
                                        "init_from": init_from, "fingerprint": fp})
     log_path = run_dir / ("pilot_log.jsonl" if pilot else "train_log.jsonl")
     if pilot and log_path.exists():
@@ -438,7 +454,7 @@ def train_sft(arm: str, export_run: str, run: str, *, epoch: int = 0, init_from:
     tmp.replace(adapter)
     meta = {"arm": arm, "epoch": epoch, "export_run": export_run, "export_pool_sha256": emeta["pool_sha256"],
             "init_from": init_from, "base_id": model_cfg["id"], "base_revision": model_cfg.get("revision"),
-            "lr": lr, "n_steps": n_steps, "grad_accum": ga, "pack_size": pack, "train_examples": tstats, "val_examples": vstats,
+            "lr": lr, "n_steps": n_steps, "grad_accum": ga, "pack_size": pack, "gpu": gpu, "train_examples": tstats, "val_examples": vstats,
             "val_loss_final": final_val, "tokens_this_session": tokens, "tokens_per_s_this_session": tok_s,
             "complete": n_steps == full_steps, "sft_version": SFT_VERSION}
     write_json(run_dir / "adapter_meta.json", meta)

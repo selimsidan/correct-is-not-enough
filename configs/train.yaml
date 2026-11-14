@@ -63,6 +63,9 @@ sft:
   # without groups). 1 = one question per sequence.
   pack_size: 8
   gradient_checkpointing: true
+  # Training stops at once on a smaller GPU: the longest shared-schema sequence peaks at about 23 GiB
+  # (A100 runs, 2026-11-14), so an L4 (22 GiB usable) runs out of memory.
+  min_gpu_memory_gb: 35
   attn_implementation: sdpa
   # Optimizer steps between checkpoints on Drive (resume after a Colab disconnect) and validation losses.
   save_every: 50
