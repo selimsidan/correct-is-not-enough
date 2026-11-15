@@ -49,6 +49,7 @@ Paths are set in [configs/paths.yaml](configs/paths.yaml) and two env vars:
 |---|---|---|
 | `00_setup_and_stage` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/00_setup_and_stage.ipynb) |
 | `10_pipeline` | L4 GPU (Part A), then CPU (Part B) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/10_pipeline.ipynb) |
+| `11_search` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/11_search.ipynb) |
 | `40_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/40_evaluate.ipynb) |
 | `50_analysis` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/50_analysis.ipynb) |
 
@@ -145,6 +146,20 @@ Configs: [generate.yaml](configs/generate.yaml) (model, sampling), [rewrite.yaml
 [pool.yaml](configs/pool.yaml) (efficiency levels, step cap, verification), prompt templates in
 [configs/prompts/](configs/prompts/). Only the model's original SQL is ever executed; the sqlglot canonical form is
 just the dedup key. Rewrites are kept only when their result matches gold.
+
+### Cost-guided search (notebook 11)
+
+The first pool has a query at least 2x cheaper than gold for only about 6% of train questions. The search gives a
+model what an engineer would look at, over several rounds: the cheapest known correct query with its step count and
+SQLite plan, and the earlier attempts with what went wrong. Answers are executed and kept only when they return
+gold's result, pass the arbitrary-row check and use no constant that appears nowhere in the question, evidence or
+gold. A pilot on 300 train questions compares Qwen2.5-Coder-32B (AWQ) with our 7B model in the same loop.
+
+```bash
+python -m effsql.gen.search --run search_pilot_32b --model 32b --limit 300   # A100; resumable
+```
+
+Settings in [search.yaml](configs/search.yaml), prompts `search_system.txt` and `search_user.txt`.
 
 ### Compute and cost
 

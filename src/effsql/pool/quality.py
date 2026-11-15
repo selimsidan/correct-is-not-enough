@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 from collections import Counter
 from typing import Any
 
@@ -123,6 +124,66 @@ def analyze(sql: str) -> dict[str, Any]:
     variant = None if untransformable else var.sql(dialect="sqlite")
     return {"flags": sorted(set(flags)), "roundtrip": roundtrip, "variant": variant,
             "untransformable": untransformable}
+
+
+_FILTERS = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.In, exp.Between, exp.Like, exp.Glob)
+_NUMBER = re.compile(r"\d+(?:\.\d+)?")
+_DATE = re.compile(r"^(\d{4}-\d{2})(-\d{2})?")
+
+
+def _literals(sql: str) -> set[str]:
+    try:
+        tree = sqlglot.parse_one(sql, read="sqlite")
+    except Exception:  # noqa: BLE001
+        return set()
+    return {_norm_literal(x) for x in tree.find_all(exp.Literal)}
+
+
+def _norm_literal(x: exp.Literal) -> str:
+    if x.is_string:
+        return x.this.strip().lower()
+    try:
+        return repr(float(x.this))
+    except ValueError:
+        return x.this.strip().lower()
+
+
+def foreign_literals(sql: str, gold_sql: str, question: str, evidence: str | None) -> list[str]:
+    """Constants used in a filter (comparison, IN, BETWEEN, LIKE) that appear neither in the gold
+    query nor in the question or evidence: e.g. `medal_id = 1` in place of `medal_name = 'Gold'`. Such a
+    query can match gold on this database because the guessed id happens to be right, which is not
+    an equivalent rewrite. Constants in LIMIT, arithmetic or the select list are not checked. A query
+    that reads no table at all is a hard-coded answer and is reported too."""
+    try:
+        tree = sqlglot.parse_one(sql, read="sqlite")
+    except Exception:  # noqa: BLE001 (unparseable: nothing to say; the database judged correctness)
+        return []
+    if tree.find(exp.Table) is None:
+        return ["(reads no table)"]  # a hard-coded answer
+    gold = _literals(gold_sql)
+    text = f"{question} {evidence or ''}".lower()
+    numbers = {repr(float(n)) for n in _NUMBER.findall(text)}
+    out = []
+    for lit in tree.find_all(exp.Literal):
+        parent = lit.parent
+        while isinstance(parent, (exp.Neg, exp.Paren, exp.Cast)):
+            parent = parent.parent
+        if not isinstance(parent, _FILTERS):
+            continue
+        key = _norm_literal(lit)
+        if key in gold:
+            continue
+        if lit.is_string:
+            core = key.strip("%_")
+            if core and (core in text or any(core in g for g in gold)):
+                continue
+            m = _DATE.match(core)  # a date bound of a month named in the question or gold (ranges)
+            if m and (m.group(1) in text or any(m.group(1) in g for g in gold)):
+                continue
+        elif key in numbers:
+            continue
+        out.append(lit.sql(dialect="sqlite"))
+    return sorted(set(out))
 
 
 def verdict(analysis: dict[str, Any], gold_hash: str | None, rt: dict[str, Any] | None,

@@ -1,0 +1,31 @@
+# Cost-guided search for cheaper correct queries (python -m effsql.gen.search), train only.
+# Each round, every question without a query at least `stop_rel_cost` x gold's cost gets one prompt
+# with its cheapest known correct query (cost, plan) and the earlier attempts with what went wrong;
+# the model answers n times. Answers are executed and checked against gold like any candidate.
+models:
+  # 4-bit AWQ (19.3 GB of weights): fits a 40 GB A100 with room for the cache. Public on Hugging Face.
+  32b:
+    id: Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
+    revision: null  # resolved to the exact commit and recorded with every record
+    dtype: auto     # AWQ weights run in float16
+    max_model_len: 16384
+    gpu_memory_utilization: 0.92
+    enable_prefix_caching: true
+  # The model we fine-tune, in the same loop: separates the gain of the loop from the gain of the bigger model.
+  7b:
+    id: Qwen/Qwen2.5-Coder-7B-Instruct
+    revision: null
+    dtype: bfloat16
+    max_model_len: 16384
+    gpu_memory_utilization: 0.90
+    enable_prefix_caching: true
+base_run: pool_v1        # its pool gives the starting query (cheapest correct, quality ok) and known candidates
+rounds: 3
+stop_rel_cost: 0.5       # a question leaves the search once it has a usable query at most this x gold's cost
+history: 6               # earlier attempts shown in the prompt (most recent first)
+sampling: {n: 4, temperature: 0.7, top_p: 0.95, max_tokens: 768}
+max_prompt_tokens: 12000
+chunk_size: 256
+seed: 0
+# Pilot (--limit): a random sample of questions, never from the validation databases of this export.
+pilot_exclude_export: sft_v1

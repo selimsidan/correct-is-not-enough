@@ -1,0 +1,15 @@
+Database schema ({db_id}):
+{schema}
+
+Evidence: {evidence}
+Question: {question}
+
+Reference query (correct; {ref_steps} steps, the dataset's gold query takes {gold_steps} steps):
+```sql
+{ref_sql}
+```
+
+SQLite query plan of the reference query:
+{plan}
+{history}
+Write one query that returns exactly the same result as the reference query and needs fewer steps.
