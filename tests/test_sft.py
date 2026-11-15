@@ -307,6 +307,24 @@ def test_cli_parses(tmp_path):
     assert read_json  # module imports cleanly
 
 
+def test_cli_dpo_overrides(monkeypatch):
+    import effsql.train.dpo as dpo
+    from effsql.train.__main__ import main
+
+    seen = {}
+
+    def fake(export, run, init_from, *, tag=None, cfg=None, max_steps=None):
+        seen.update(cfg["dpo"], init_from=init_from)
+        return {"arm": "best", "tag": tag, "init_from": init_from, "lr": cfg["dpo"]["lr"],
+                "epochs": cfg["dpo"]["epochs"], "n_steps": 1, "complete": True, "val_final": {}}
+
+    monkeypatch.setattr(dpo, "train_dpo", fake)
+    main(["dpo", "--export", "e", "--run", "r", "--init-from", "s", "--lr", "5e-5", "--epochs", "2"])
+    default = load_config("train.yaml")["dpo"]
+    assert seen["lr"] == 5e-5 and seen["epochs"] == 2 and seen["init_from"] == "s"
+    assert seen["beta"] == default["beta"] and seen["rpo_alpha"] == default["rpo_alpha"]
+
+
 def test_dpo_loss_and_sequences():
     import math
 

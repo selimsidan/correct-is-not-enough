@@ -305,7 +305,7 @@ def train_dpo(export_run: str, run: str, init_from: str, *, tag: str | None = No
     meta = {"arm": arm, "method": f"dpo-{arm}", "tag": tag, "epoch": imeta["epoch"], "export_run": imeta["export_run"],
             "dpo_export_run": export_run, "init_from": init_from, "export_pool_sha256": emeta["pool_sha256"],
             "base_id": model_cfg["id"], "base_revision": model_cfg.get("revision"), "beta": d["beta"],
-            "rpo_alpha": d["rpo_alpha"], "lr": d["lr"], "n_steps": n_steps, "gpu": gpu, "train_pairs": tstats,
+            "rpo_alpha": d["rpo_alpha"], "lr": d["lr"], "epochs": int(d.get("epochs", 1)), "n_steps": n_steps, "gpu": gpu, "train_pairs": tstats,
             "val_pairs": vstats, "val_final": final_val, "tokens_this_session": tokens,
             "complete": n_steps == full_steps, "dpo_version": DPO_VERSION}
     write_json(run_dir / "adapter_meta.json", meta)

@@ -53,8 +53,12 @@ def cmd_sft(a: argparse.Namespace) -> None:
 def cmd_dpo(a: argparse.Namespace) -> None:
     from effsql.train.dpo import train_dpo
 
-    meta = train_dpo(a.export, a.run, a.init_from, tag=a.tag, max_steps=a.max_steps)
-    print(json.dumps({k: meta[k] for k in ("arm", "tag", "init_from", "n_steps", "complete", "val_final")},
+    cfg = load_config("train.yaml")
+    for k in ("lr", "epochs", "beta", "rpo_alpha"):  # command-line settings override train.yaml dpo
+        if getattr(a, k) is not None:
+            cfg["dpo"][k] = getattr(a, k)
+    meta = train_dpo(a.export, a.run, a.init_from, tag=a.tag, cfg=cfg, max_steps=a.max_steps)
+    print(json.dumps({k: meta[k] for k in ("arm", "tag", "init_from", "lr", "epochs", "n_steps", "complete", "val_final")},
                      indent=2, default=str))
 
 
@@ -161,6 +165,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--run", required=True)
     p.add_argument("--init-from", required=True, help="finished SFT run whose adapter starts DPO (and is the reference)")
     p.add_argument("--tag", help="tagged model: the efficiency target in every prompt (e.g. +1.5)")
+    p.add_argument("--lr", type=float, help="override train.yaml dpo.lr")
+    p.add_argument("--epochs", type=int, help="override train.yaml dpo.epochs")
+    p.add_argument("--beta", type=float, help="override train.yaml dpo.beta")
+    p.add_argument("--rpo-alpha", type=float, help="override train.yaml dpo.rpo_alpha")
     p.add_argument("--max-steps", type=int, help="stop early (smoke tests only)")
     p.set_defaults(func=cmd_dpo)
     p = sub.add_parser("predict")
