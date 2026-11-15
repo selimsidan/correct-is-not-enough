@@ -1,12 +1,16 @@
-"""Choosing the SFT method on the validation databases (never on dev or minidev, which stay a clean test).
+"""Choosing between trained models on the validation databases (never on dev or minidev, which stay a clean test).
 
-Rule (fixed before any run, 2026-11-14):
-  1. Correctness first: keep the methods whose validation EX is not significantly below the best
-     method's (exact two-sided McNemar test on the questions both answered, alpha 0.05).
-  2. Among those, the most efficient wins: the largest share of questions answered correctly with a
-     query at least 2x cheaper than gold (rel_cost <= 0.5, smoothed steps); ties by the lower median
-     cost relative to gold among correct answers, then by EX.
-Input: eval_train.jsonl of `effsql evaluate --split train` per method (the validation predictions).
+Rule (2026-11-15; replaces the first rule, which ranked by the share of answers at least 2x cheaper
+than gold: about 14 questions per model on validation, too few to separate models):
+  1. Correctness first: keep the models whose validation EX is not significantly below the best
+     model's (exact two-sided McNemar test on the same questions, alpha 0.05).
+  2. Among those, the highest step-based R-VES wins (BIRD's reward per question, with step counts in
+     place of seconds; gold = 100, wrong = 0). Ties by efficiency per correct answer, then by EX.
+Also reported, not used to choose: VES (unbounded, driven by a few extreme speed-ups), answers >= 2x
+cheaper or slower than gold, median cost, and every model against the winner on the same questions
+(R-VES difference with a Wilcoxon signed-rank test; how often each is cheaper when both are correct,
+with a sign test).
+Input: eval_train.jsonl of `effsql evaluate --split train` per model (the validation predictions).
 """
 
 from __future__ import annotations
@@ -16,27 +20,36 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.stats import binomtest
+from scipy.stats import binomtest, wilcoxon
 
 from effsql.evaluate import is_current
 from effsql.io import latest_by, write_json
+from effsql.measure.metrics import step_scores
 
 log = logging.getLogger(__name__)
 CHEAP = 0.5  # rel_cost <= 0.5: at least 2x cheaper than gold
+SAME = 0.1  # both correct: costs within 10% count as equal in the cheaper/costlier counts
 
 
 def method_stats(recs: dict[str, dict[str, Any]], qids: list[str]) -> dict[str, Any]:
     rows = [recs[q] for q in qids]
     correct = [bool(r["correct"]) for r in rows]
     costs = [r["rel_cost"] for r in rows if r["correct"] and r.get("rel_cost") is not None]
+    scores = [step_scores(r) for r in rows]
+    if not rows:
+        return {"n": 0}
     return {
         "n": len(rows),
-        "ex": 100 * float(np.mean(correct)) if rows else None,
+        "ex": 100 * float(np.mean(correct)),
+        "rves": float(np.mean([s[0] for s in scores])),
+        "eff_per_correct": float(np.mean([s[0] for s, c in zip(scores, correct) if c])) if any(correct) else None,
+        "ves": float(np.mean([s[1] for s in scores])),
         "cheap_2x": 100 * float(np.mean([bool(r["correct"] and r.get("rel_cost") is not None and r["rel_cost"] <= CHEAP)
-                                         for r in rows])) if rows else None,
-        "rel_cost_median": float(np.median(costs)) if costs else None,
+                                         for r in rows])),
         "slower_2x": 100 * float(np.mean([bool(r["correct"] and r.get("rel_cost") is not None and r["rel_cost"] >= 2.0)
-                                          for r in rows])) if rows else None,
+                                          for r in rows])),
+        "rel_cost_median": float(np.median(costs)) if costs else None,
+        "rel_cost_geomean": float(np.exp(np.mean(np.log(costs)))) if costs else None,
     }
 
 
@@ -47,8 +60,29 @@ def mcnemar_p(a: list[bool], b: list[bool]) -> float:
     return 1.0 if n10 + n01 == 0 else float(binomtest(min(n10, n01), n10 + n01, 0.5).pvalue)
 
 
+def paired(a: dict[str, dict[str, Any]], b: dict[str, dict[str, Any]], qids: list[str]) -> dict[str, Any]:
+    """Model b against model a on the same questions."""
+    ra = np.array([step_scores(a[q])[0] for q in qids])
+    rb = np.array([step_scores(b[q])[0] for q in qids])
+    d = rb - ra
+    p_rves = float(wilcoxon(d).pvalue) if np.any(d != 0) else 1.0
+    cheaper = costlier = 0
+    for q in qids:
+        x, y = a[q], b[q]
+        if x["correct"] and y["correct"] and x.get("rel_cost") and y.get("rel_cost"):
+            r = y["rel_cost"] / x["rel_cost"]
+            cheaper += r < 1 - SAME
+            costlier += r > 1 / (1 - SAME)
+    return {
+        "rves_diff": float(d.mean()), "p_rves": p_rves,
+        "p_ex": mcnemar_p([bool(a[q]["correct"]) for q in qids], [bool(b[q]["correct"]) for q in qids]),
+        "cheaper": int(cheaper), "costlier": int(costlier),
+        "p_cost": float(binomtest(cheaper, cheaper + costlier, 0.5).pvalue) if cheaper + costlier else 1.0,
+    }
+
+
 def select_method(eval_dirs: dict[str, Path], alpha: float = 0.05, out: Path | None = None) -> dict[str, Any]:
-    """eval_dirs: method name -> run dir holding eval_train.jsonl. Returns the table and the winner."""
+    """eval_dirs: model name -> run dir holding eval_train.jsonl. Returns the table and the winner."""
     recs = {m: latest_by(d / "eval_train.jsonl", where=is_current) for m, d in eval_dirs.items()}
     missing = [m for m, r in recs.items() if not r]
     if missing:
@@ -63,9 +97,10 @@ def select_method(eval_dirs: dict[str, Path], alpha: float = 0.05, out: Path | N
         stats[m]["p_vs_best_ex"] = p
         stats[m]["eligible"] = m == best_ex or p >= alpha
     eligible = [m for m in stats if stats[m]["eligible"]]
-    winner = max(eligible, key=lambda m: (stats[m]["cheap_2x"],
-                                          -(stats[m]["rel_cost_median"] if stats[m]["rel_cost_median"] is not None else 9e9),
+    winner = max(eligible, key=lambda m: (round(stats[m]["rves"], 6), stats[m]["eff_per_correct"] or 0.0,
                                           stats[m]["ex"], m))
+    for m in stats:
+        stats[m]["vs_winner"] = None if m == winner else paired(recs[winner], recs[m], qids)
     res = {"n_questions": len(qids), "alpha": alpha, "best_ex_method": best_ex, "winner": winner,
            "methods": stats, "rule": __doc__.split("Rule", 1)[1].split("Input:")[0].strip()}
     if out:
@@ -73,11 +108,28 @@ def select_method(eval_dirs: dict[str, Path], alpha: float = 0.05, out: Path | N
     return res
 
 
+def _f(x: float | None, fmt: str) -> str:
+    return "-" if x is None else format(x, fmt)
+
+
 def format_table(res: dict[str, Any]) -> str:
-    lines = [f"{'method':<28}{'EX':>7}{'>=2x cheaper':>14}{'median cost':>13}{'>=2x slower':>13}{'p vs best':>11}  eligible"]
+    """The selection table, then each model against the winner on the same questions."""
+    w = max(28, max(len(m) for m in res["methods"]) + 2)
+    lines = [f"{'model':<{w}}{'EX':>7}{'R-VES':>8}{'R-VES/EX':>10}{'VES':>8}{'>=2x cheaper':>14}"
+             f"{'>=2x slower':>13}{'median cost':>13}{'p EX vs best':>14}  eligible"]
     for m, s in res["methods"].items():
-        med = f"{s['rel_cost_median']:.3f}" if s["rel_cost_median"] is not None else "-"
-        lines.append(f"{m:<28}{s['ex']:>7.1f}{s['cheap_2x']:>13.1f}%{med:>13}{s['slower_2x']:>12.1f}%"
-                     f"{s['p_vs_best_ex']:>11.3f}  {'yes' if s['eligible'] else 'no'}")
-    lines.append(f"winner: {res['winner']} ({res['n_questions']} validation questions)")
+        lines.append(f"{m:<{w}}{s['ex']:>7.1f}{s['rves']:>8.1f}{_f(s['eff_per_correct'], '.1f'):>10}{s['ves']:>8.1f}"
+                     f"{s['cheap_2x']:>13.1f}%{s['slower_2x']:>12.1f}%{_f(s['rel_cost_median'], '.3f'):>13}"
+                     f"{s['p_vs_best_ex']:>14.3f}  {'yes' if s['eligible'] else 'no'}")
+    lines.append(f"winner: {res['winner']} (highest R-VES among eligible; {res['n_questions']} validation questions)")
+    lines.append("")
+    lines.append(f"against the winner, same questions:")
+    lines.append(f"{'model':<{w}}{'R-VES diff':>11}{'p':>8}{'p EX':>8}{'cheaper':>9}{'costlier':>10}{'p':>8}")
+    for m, s in res["methods"].items():
+        v = s["vs_winner"]
+        if v:
+            lines.append(f"{m:<{w}}{v['rves_diff']:>+11.2f}{v['p_rves']:>8.3f}{v['p_ex']:>8.3f}"
+                         f"{v['cheaper']:>9}{v['costlier']:>10}{v['p_cost']:>8.3f}")
+    lines.append("(cheaper/costlier: questions both answer correctly where this model's query costs at least 10% "
+                 "less / more than the winner's)")
     return "\n".join(lines)

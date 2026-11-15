@@ -13,7 +13,7 @@ import statistics
 from collections import Counter
 from typing import Any
 
-from effsql.measure.bird_official import rves_score, ves_score
+from effsql.measure.bird_official import reward_from_ratio, rves_score, ves_score
 
 DIFFICULTIES = ("simple", "moderate", "challenging")
 
@@ -27,6 +27,17 @@ def _mean_std(xs: list[float]) -> tuple[float | None, float | None]:
     if not xs:
         return None, None
     return statistics.fmean(xs), (statistics.stdev(xs) if len(xs) > 1 else 0.0)
+
+
+def step_scores(rec: dict[str, Any]) -> tuple[float, float]:
+    """(R-VES, VES) of one question with step counts in place of seconds: speed-up = 1 / rel_cost
+    (gold = 100 on both). Wrong answers score 0. A correct answer whose steps could not be counted
+    scores as gold. R-VES buckets the speed-up (>= 2x faster 112, 1-2x 100, up to 2x slower 87,
+    2-4x slower 71, slower 50); VES is 100 * sqrt(speed-up), unbounded."""
+    if not rec["correct"]:
+        return 0.0, 0.0
+    ratio = 1.0 / rec["rel_cost"] if rec.get("rel_cost") else 1.0
+    return 100 * math.sqrt(reward_from_ratio(ratio)), 100 * math.sqrt(ratio)
 
 
 def group_metrics(
@@ -45,6 +56,13 @@ def group_metrics(
         out["n_with_tied_gold"] = sum(r.get("correct_tied") is not None for r in recs)
 
     out["n_correct_without_steps"] = sum(1 for r in recs if r["correct"] and r.get("rel_cost") is None)
+    # Step-based R-VES (main metric) and VES; eff_per_correct is R-VES over correct answers only
+    # (efficiency apart from accuracy, gold = 100).
+    scores = [step_scores(r) for r in recs]
+    out["rves_steps"] = statistics.fmean(s[0] for s in scores) if recs else None
+    out["ves_steps"] = statistics.fmean(s[1] for s in scores) if recs else None
+    out["eff_per_correct"] = (statistics.fmean(s[0] for s, c in zip(scores, correct) if c)
+                              if any(correct) else None)
     out["rel_cost_median"] = statistics.median(costs) if costs else None
     out["rel_cost_geomean"] = math.exp(statistics.fmean(math.log(c) for c in costs)) if costs else None
     thr = cfg.get("faster_than_gold", 0.9)

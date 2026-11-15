@@ -104,6 +104,14 @@ Predictions: our JSONL (`{"qid": "dev_0", "sql": "..."}` per line) or the offici
 | relative cost | `(steps_pred + c) / (steps_gold + c)` for correct predictions, c = progress handler period |
 | faster than gold | share of correct predictions with relative cost below 0.9 |
 | efficient accuracy at tau | share of questions that are correct with relative cost <= tau |
+| R-VES (steps) | R-VES with speed-up = 1 / relative cost instead of timed seconds: deterministic, gold = 100, wrong = 0; the main metric for choosing between trained models |
+| R-VES/EX | R-VES (steps) over the correct answers only: efficiency apart from accuracy (100 = as cheap as gold) |
+| VES (steps) | `mean(sqrt(1 / relative cost)) * 100`, unbounded, so a few extreme speed-ups dominate it; reported, not used to choose |
+
+Trained models are chosen on the validation databases only (`python -m effsql.train select`): among the
+models whose EX is not significantly below the best (McNemar), the highest R-VES (steps) wins.
+`python -m effsql.train report` prints every model on validation, dev and mini-dev from the saved
+evaluations, with a bootstrap interval for R-VES and paired tests against a reference model.
 
 `vm_steps` counts SQLite VM instructions through a progress handler (every N = 10 instructions). It is
 deterministic: connections load the schema at open and do not cache prepared statements.

@@ -45,7 +45,7 @@ def is_current(rec: dict[str, Any]) -> bool:
     return rec.get("eval_version") == EVAL_VERSION
 LEDGER_COLUMNS = [
     "timestamp", "run", "git_commit", "git_dirty", "model", "method", "split", "n", "timing", "repeats",
-    "ex", "ex_tied", "rves_mean", "rves_std", "ves_mean", "ves_std", "quick_ratio_median",
+    "ex", "ex_tied", "rves_steps", "eff_per_correct", "ves_steps", "rves_mean", "rves_std", "ves_mean", "ves_std", "quick_ratio_median",
     "rel_cost_median", "rel_cost_geomean", "faster_than_gold_rate", "eff_acc@1.5",
     "cpu_model", "cpu_count", "pred",
 ]
@@ -294,6 +294,7 @@ def evaluate(
         "model": model, "method": method, "split": split, "n": o["n"], "timing": timing,
         "repeats": repeat if timing != "none" else 0,
         "ex": o["ex"], "ex_tied": o.get("ex_tied"),
+        "rves_steps": o["rves_steps"], "eff_per_correct": o["eff_per_correct"], "ves_steps": o["ves_steps"],
         "rves_mean": o.get("rves_mean"), "rves_std": o.get("rves_std"),
         "ves_mean": o.get("ves_mean"), "ves_std": o.get("ves_std"),
         "quick_ratio_median": o.get("quick_ratio_median_mean"),

@@ -8,6 +8,7 @@
   eval-val  score the validation predictions (CPU: correctness and step counts, no timing)
   select    the method selection rule over several trained runs
   winner    print the selected run, arm and tag
+  report    results table over models and splits from saved evaluations (R-VES, VES, paired tests)
 """
 
 from __future__ import annotations
@@ -120,6 +121,19 @@ def cmd_winner(a: argparse.Namespace) -> None:
                       "adapter_run": meta.get("adapter_run", run)}))
 
 
+def cmd_report(a: argparse.Namespace) -> None:
+    from effsql.train.report import build_report, format_report
+
+    paths = load_paths()
+    rep = build_report(paths.runs_dir, _csv(a.runs), ref=a.ref, splits=tuple(_csv(a.splits)))
+    labels = dict(x.split("=", 1) for x in _csv(a.labels) or [])
+    text = format_report(rep, labels)
+    print(text)
+    if a.out:
+        write_json(paths.run_dir(a.out) / "report.json", rep)
+        (paths.run_dir(a.out) / "report.txt").write_text(text + "\n", encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="python -m effsql.train", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -169,6 +183,14 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("winner")
     p.add_argument("--selection", required=True)
     p.set_defaults(func=cmd_winner)
+    p = sub.add_parser("report")
+    p.add_argument("--runs", required=True, help="comma list of runs; one containing {split} is a template "
+                   "(zero-shot: pool_v1_{split}_base)")
+    p.add_argument("--ref", help="reference run for the paired comparisons (default: the first)")
+    p.add_argument("--splits", default="val,dev,minidev")
+    p.add_argument("--labels", help="comma list run=label for shorter names")
+    p.add_argument("--out", help="run name to save report.json and report.txt in")
+    p.set_defaults(func=cmd_report)
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S")
     args.func(args)

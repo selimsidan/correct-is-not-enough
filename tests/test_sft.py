@@ -3,6 +3,7 @@ and the method selection rule. Uses a tiny random Qwen2 model and an offline tok
 
 import importlib.util
 import json
+import math
 
 import pytest
 
@@ -28,7 +29,7 @@ from effsql.pool.quality import quality  # noqa: E402
 from effsql.pool.screen import screen  # noqa: E402
 from effsql.train.data import read_export, train_export, train_messages  # noqa: E402
 from effsql.train.predict_sft import predict_sft  # noqa: E402
-from effsql.train.select import mcnemar_p, select_method  # noqa: E402
+from effsql.train.select import format_table, mcnemar_p, select_method  # noqa: E402
 from effsql.train.sft import (END_OF_TURN, TrainExample, build_examples, group_losses,  # noqa: E402
                               load_tokenizer, make_counter, packed_len, plan_steps, prompt_text,
                               shared_prefix_len, train_sft)
@@ -243,6 +244,59 @@ def test_selection_rule(tmp_path):
     assert res["methods"]["b"]["eligible"] and not res["methods"]["c"]["eligible"]
     assert json.loads((tmp_path / "sel.json").read_text())["winner"] == "b"
     assert mcnemar_p([True] * 10, [True] * 10) == 1.0
+    # R-VES: >= 2x cheaper scores 100 * sqrt(1.25), as cheap as gold 100, wrong 0
+    big = 100 * math.sqrt(1.25)
+    assert res["methods"]["a"]["rves"] == pytest.approx((20 * big + 140 * 100) / n)
+    assert res["methods"]["b"]["rves"] == pytest.approx((60 * big + 96 * 100) / n)
+    assert res["methods"]["b"]["eff_per_correct"] == pytest.approx((60 * big + 96 * 100) / 156)
+    v = res["methods"]["a"]["vs_winner"]
+    assert res["methods"]["b"]["vs_winner"] is None
+    assert (v["cheaper"], v["costlier"]) == (0, 40)  # questions 20-59: a costs 1.0, b 0.4
+    assert v["rves_diff"] == pytest.approx(res["methods"]["a"]["rves"] - res["methods"]["b"]["rves"])
+    assert "against the winner" in format_table(res)
+
+    # higher R-VES wins over more >= 2x cheaper answers when the rest of those answers are slow
+    d = write("d", [i < 160 for i in range(n)], [0.4 if i < 40 else (3.0 if i < 120 else 1.0) for i in range(n)])
+    e = write("e", [i < 160 for i in range(n)], [0.4 if i < 30 else 1.0 for i in range(n)])
+    assert select_method({"d": d, "e": e})["winner"] == "e"
+
+
+def test_step_scores_and_report(tmp_path):
+    from effsql.measure.metrics import group_metrics, step_scores
+    from effsql.train.report import build_report, format_report
+
+    assert step_scores({"correct": False, "rel_cost": None}) == (0.0, 0.0)
+    assert step_scores({"correct": True, "rel_cost": 1.0}) == (100.0, 100.0)
+    assert step_scores({"correct": True, "rel_cost": None}) == (100.0, 100.0)  # steps not counted: as gold
+    r, v = step_scores({"correct": True, "rel_cost": 0.25})
+    assert r == pytest.approx(100 * math.sqrt(1.25)) and v == pytest.approx(200.0)
+    assert step_scores({"correct": True, "rel_cost": 3.0})[0] == pytest.approx(100 * math.sqrt(0.5))
+    recs = [{"qid": "a", "correct": True, "rel_cost": 0.25, "error_type": None},
+            {"qid": "b", "correct": False, "rel_cost": None, "error_type": None}]
+    m = group_metrics(recs, [], "none", {})
+    assert m["rves_steps"] == pytest.approx(50 * math.sqrt(1.25)) and m["ves_steps"] == pytest.approx(100.0)
+    assert m["eff_per_correct"] == pytest.approx(100 * math.sqrt(1.25))
+
+    def write(d, split_file, correct, cost):
+        append_jsonl(tmp_path / d / f"eval_{split_file}.jsonl",
+                     [{"qid": f"q{i}", "eval_version": EVAL_VERSION, "correct": c, "rel_cost": r if c else None}
+                      for i, (c, r) in enumerate(zip(correct, cost))])
+
+    n = 60
+    for split, f in (("val", "train"), ("dev", "dev")):
+        write(f"m1_{split}", f, [i < 40 for i in range(n)], [1.0] * n)
+        write(f"m2_{split}", f, [i < 45 for i in range(n)], [0.4 if i < 10 else 1.0 for i in range(n)])
+    write("zs_dev_base", "dev", [i < 30 for i in range(n)], [1.0] * n)
+    rep = build_report(tmp_path, ["m1", "zs_{split}_base", "m2"], splits=("val", "dev", "minidev"))
+    assert list(rep["splits"]) == ["val", "dev"]  # no minidev evaluations: split left out
+    assert list(rep["splits"]["val"]["models"]) == ["m1", "m2"]  # no zero-shot on validation
+    m2 = rep["splits"]["dev"]["models"]["m2"]
+    assert m2["vs_ref"]["cheaper"] == 10 and m2["vs_ref"]["costlier"] == 0
+    lo, hi = m2["rves_ci"]
+    assert lo <= m2["rves"] <= hi
+    assert rep["splits"]["dev"]["models"]["m1"]["vs_ref"] is None
+    text = format_report(rep, {"zs_{split}_base": "zero-shot"})
+    assert "zero-shot" in text and "== dev (60 questions) ==" in text
 
 
 def test_cli_parses(tmp_path):
