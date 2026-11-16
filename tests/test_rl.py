@@ -91,7 +91,7 @@ def test_rl_end_to_end(setup):  # noqa: F811 (the fixture from test_sft)
 
     p, cfg, gen_cfg = setup
     train_sft("gold", "exp", "S", paths=p, cfg=cfg, gen_cfg=gen_cfg, device="cpu")
-    cfg["rl"].update(iterations=2, questions_per_iter=2, samples=4, questions_per_step=1, lr=1e-3,
+    cfg["rl"].update(iterations=2, questions_per_iter=2, samples=4, questions_per_step=1, lr=1e-3, snapshot_every=1,
                      max_answer_tokens_per_seq=60,  # several sequences per question: exercises the split
                      pilot={"iterations": 1, "questions_per_iter": 2})
     tok = load_tokenizer(gen_cfg["model"])
@@ -113,7 +113,7 @@ def test_rl_end_to_end(setup):  # noqa: F811 (the fixture from test_sft)
     assert set(rows) == {"train_0", "train_1", "train_2"}
     m = rows["train_0"]
     assert m["status"] == ["correct", "correct", "wrong_result", "no_sql"]
-    assert m["reward"][0] > m["reward"][1] >= 0.5 and m["reward"][2:] == [0.0, 0.0]
+    assert m["reward"][0] > m["reward"][1] > 0 and m["reward"][2:] == [0.0, 0.0]
     assert rows["train_2"]["status"] == ["correct", "first_row_pick", "foreign_constant", "cut_off"]
     assert rows["train_2"]["reward"][1:] == [0.0, 0.0, 0.0]
 
@@ -128,6 +128,9 @@ def test_rl_end_to_end(setup):  # noqa: F811 (the fixture from test_sft)
     assert all(r["approx_kl"] is not None for r in log if r["n_steps"])
     am = read_json(p.run_dir("R") / "adapter_meta.json")
     assert am["complete"] and am["arm"] == "gold" and am["method"] == "rl-gold" and am["export_run"] == "exp"
+    snap = read_json(p.run_dir("R_it1") / "adapter_meta.json")   # a snapshot after iteration 1 of 2
+    assert snap["complete"] and snap["iterations"] == 1 and am["iterations"] == 2
+    assert not (p.run_dir("R_it2", create=False)).exists()       # the last iteration is the run itself
     a, b = adapter_weights(p.run_dir("R")), adapter_weights(p.run_dir("S"))
     assert any(not torch.allclose(a[k], b[k]) for k in a)            # RL moved the adapter
 

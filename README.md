@@ -167,7 +167,7 @@ Settings in [search.yaml](configs/search.yaml), prompts `search_system.txt` and 
 
 The model writes 8 answers per train question; every answer is executed and scored (0 when wrong, failing,
 cut off, an arbitrary-row pick that gold does not use, or using a constant found nowhere in the question,
-evidence or gold; 0.5 to 1.5 when correct, by its cost relative to gold); the better answers of each
+evidence or gold; 0.1 to 1.9 when correct, by its cost relative to gold); the better answers of each
 question are made more likely than its other answers (clipped policy gradient, GRPO-style, no KL term).
 Generation (vLLM) and training alternate in separate processes; every iteration is saved.
 

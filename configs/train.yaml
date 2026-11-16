@@ -105,7 +105,8 @@ rl:
   # An iteration: `questions_per_iter` new train questions (never the validation databases), `samples`
   # answers each from the current model (vLLM, temperature 1: exactly the model's distribution), every
   # answer executed and scored, then one pass of policy-gradient updates on those answers.
-  iterations: 16
+  # 24 x 128 = 3,072 questions (2026-11-16, after the pilot: about 7.5 minutes per iteration on an A100).
+  iterations: 24
   questions_per_iter: 128
   samples: 8
   max_tokens: 512
@@ -115,9 +116,11 @@ rl:
     # and constants found nowhere in the question, evidence or gold (pool/quality.py). These matched
     # gold in the pilot only by luck and cost strong DPO accuracy on dev.
     # Correct: 1 + eff_weight * e / eff_clip with e = log2((gold_steps + smooth) / (steps + smooth))
-    # clipped to [-eff_clip, eff_clip]: between 0.5 (4x costlier than gold) and 1.5 (4x cheaper), so a
+    # clipped to [-eff_clip, eff_clip]: between 0.1 (4x costlier than gold) and 1.9 (4x cheaper), so a
     # correct answer always beats a wrong one. smooth (steps) keeps tiny queries from counting as wins.
-    eff_weight: 0.5
+    # 0.9 (was 0.5): in the pilot the model's own answers to a question rarely differ in cost, so cost made
+    # only about 10% of the training signal at 0.5 (about 17% at 0.9).
+    eff_weight: 0.9
     eff_clip: 2.0
     smooth_steps: 100
   # Execution while training (correctness as in screening, step counting capped at this x gold).
@@ -128,7 +131,9 @@ rl:
   # standard deviation, so tiny cost differences are not blown up); questions whose answers all score
   # the same give no signal and are skipped. Clipped ratio loss (PPO), averaged over answer tokens.
   # No KL term: correctness is in the reward, and validation decides whether the result is kept.
-  lr: 1.0e-5
+  # 5e-5 (was 1e-5): at 1e-5 the pilot's updates were far below a normal policy step (approximate KL
+  # 1e-4, 0.02% of tokens clipped; usual values are about 1e-3 to 1e-2 and a few percent).
+  lr: 5.0e-5
   warmup_steps: 2
   questions_per_step: 16
   clip_eps: 0.2
@@ -137,6 +142,9 @@ rl:
   max_answer_tokens_per_seq: 2048
   # vLLM runs alone on the GPU in its own process (the trainer runs after it, in another process).
   gpu_memory_utilization: 0.85
+  # A copy of the adapter every this many iterations goes to its own run <run>_it<n> (predicted and
+  # compared on validation like the final model: the number of iterations is chosen there).
+  snapshot_every: 8
   # Pilot (`rl --pilot`): measures time per phase and reward movement, projects the full run's cost.
   pilot: {iterations: 2, questions_per_iter: 32}
   keep_iterations: 2

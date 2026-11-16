@@ -239,7 +239,7 @@ def eff_term(steps: float, gold_steps: float, rw: dict[str, Any]) -> float:
 
 
 def reward(status: str, steps: float | None, gold_steps: float, rw: dict[str, Any]) -> float:
-    """0 unless correct; a correct answer gets 1 + eff_weight * e / eff_clip (0.5 to 1.5 by default). A
+    """0 unless correct; a correct answer gets 1 + eff_weight * e / eff_clip (0.1 to 1.9 with eff_weight 0.9). A
     correct answer without a step count (counting failed or stopped at the cap) counts as the costliest."""
     if status != CORRECT:
         return 0.0
@@ -502,6 +502,13 @@ def train_iter(run: str, k: int, *, paths: Paths | None = None, cfg: dict[str, A
                ckpt.with_suffix(".pt.tmp"))
     ckpt.with_suffix(".pt.tmp").replace(ckpt)
 
+    # the finished model or a snapshot first: an iteration counts as done only after it
+    n_iters = rl["iterations"]
+    every = rl.get("snapshot_every")
+    if k == n_iters - 1:
+        write_model(run_dir, out, meta, model_cfg, k + 1, global_step, gpu)
+    elif every and (k + 1) % every == 0:
+        write_model(paths.run_dir(f"{run}_it{k + 1}"), out, meta, model_cfg, k + 1, global_step, gpu)
     score = read_json(d / "score_stats.json")
     rec = {"iteration": k, **{f"score_{a}": score.get(a) for a in ("pct_correct", "mean_reward", "correct_geomean_rel_cost",
                                                                     "correct_pct_2x_cheaper", "correct_pct_costlier_10pct")},
@@ -519,17 +526,6 @@ def train_iter(run: str, k: int, *, paths: Paths | None = None, cfg: dict[str, A
     log.info("rl iteration %d trained: %d questions with signal, %d steps, clip %.3f, kl %.4f", k, len(units),
              len(steps), rec["clip_frac"] or 0, rec["approx_kl"] or 0)
 
-    n_iters = rl["iterations"]
-    if k == n_iters - 1:
-        final = run_dir / "adapter"
-        if final.exists():
-            shutil.rmtree(final)
-        shutil.copytree(out, final)
-        write_json(run_dir / "adapter_meta.json", {
-            "arm": meta["arm"], "method": f"rl-{meta['arm']}", "tag": meta["tag"], "epoch": meta["epoch"],
-            "export_run": meta["export_run"], "init_from": meta["init_from"], "base_id": model_cfg["id"],
-            "base_revision": model_cfg.get("revision"), "rl": rl, "iterations": n_iters, "global_steps": global_step,
-            "gpu": gpu, "complete": True, "rl_version": RL_VERSION})
     for j in range(k - rl.get("keep_iterations", 2) + 1):  # older adapters and optimizer states
         old_d = iter_dir(run_dir, j) / "adapter"
         if old_d.exists():
@@ -538,6 +534,21 @@ def train_iter(run: str, k: int, *, paths: Paths | None = None, cfg: dict[str, A
         if old_c.exists():
             old_c.unlink()
     return rec
+
+
+def write_model(dest: Path, adapter: Path, meta: dict[str, Any], model_cfg: dict[str, Any], n_iters: int,
+                global_step: int, gpu: str) -> None:
+    """The adapter after n_iters iterations as a finished run (adapter/ and adapter_meta.json), so
+    `predict`, `eval-val`, `select` and `report` treat it like any other adapter."""
+    final = dest / "adapter"
+    if final.exists():
+        shutil.rmtree(final)
+    shutil.copytree(adapter, final)
+    write_json(dest / "adapter_meta.json", {
+        "arm": meta["arm"], "method": f"rl-{meta['arm']}", "tag": meta["tag"], "epoch": meta["epoch"],
+        "export_run": meta["export_run"], "init_from": meta["init_from"], "base_id": model_cfg["id"],
+        "base_revision": model_cfg.get("revision"), "rl": meta["fingerprint"]["rl"], "iterations": n_iters,
+        "global_steps": global_step, "gpu": gpu, "complete": True, "rl_version": RL_VERSION})
 
 
 # Orchestration ----------------------------------------------------------------------------------
