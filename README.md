@@ -50,6 +50,8 @@ Paths are set in [configs/paths.yaml](configs/paths.yaml) and two env vars:
 | `00_setup_and_stage` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/00_setup_and_stage.ipynb) |
 | `10_pipeline` | L4 GPU (Part A), then CPU (Part B) | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/10_pipeline.ipynb) |
 | `11_search` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/11_search.ipynb) |
+| `32_rl` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/32_rl.ipynb) |
+| `33_rl_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/33_rl_evaluate.ipynb) |
 | `40_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/40_evaluate.ipynb) |
 | `50_analysis` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/50_analysis.ipynb) |
 
@@ -160,6 +162,21 @@ python -m effsql.gen.search --run search_pilot_32b --model 32b --limit 300   # A
 ```
 
 Settings in [search.yaml](configs/search.yaml), prompts `search_system.txt` and `search_user.txt`.
+
+### Reinforcement learning with an execution reward (notebooks 32, 33)
+
+The model writes 8 answers per train question; every answer is executed and scored (0 when wrong, failing,
+cut off, an arbitrary-row pick that gold does not use, or using a constant found nowhere in the question,
+evidence or gold; 0.5 to 1.5 when correct, by its cost relative to gold); the better answers of each
+question are made more likely than its other answers (clipped policy gradient, GRPO-style, no KL term).
+Generation (vLLM) and training alternate in separate processes; every iteration is saved.
+
+```bash
+python -m effsql.train rl --run rl_v1_pilot --init-from sft_v1_best_e1 --pilot   # cost projection first
+python -m effsql.train rl --run rl_v1 --init-from sft_v1_best_e1                 # A100; resumable
+```
+
+Settings in the `rl` section of [train.yaml](configs/train.yaml).
 
 ### Compute and cost
 

@@ -148,12 +148,22 @@ def _norm_literal(x: exp.Literal) -> str:
         return x.this.strip().lower()
 
 
+def _as_float(x: str) -> float:
+    try:
+        return float(x)
+    except ValueError:
+        return 0.0
+
+
 def foreign_literals(sql: str, gold_sql: str, question: str, evidence: str | None) -> list[str]:
-    """Constants used in a filter (comparison, IN, BETWEEN, LIKE) that appear neither in the gold
-    query nor in the question or evidence: e.g. `medal_id = 1` in place of `medal_name = 'Gold'`. Such a
-    query can match gold on this database because the guessed id happens to be right, which is not
-    an equivalent rewrite. Constants in LIMIT, arithmetic or the select list are not checked. A query
-    that reads no table at all is a hard-coded answer and is reported too."""
+    """Constants that appear neither in the gold query nor in the question or evidence, so the query
+    can match gold only because a value read off this database happens to be right:
+      in a filter (comparison, IN, BETWEEN, LIKE): any such constant, e.g. `medal_id = 1` in place of
+        `medal_name = 'Gold'`;
+      elsewhere (select list, arithmetic): numbers above 100 in absolute value, e.g. a continent's area
+        typed in instead of joined (small numbers such as 1, 2 or 100 are counting and percentages).
+    Constants in LIMIT and OFFSET are not checked. A query that reads no table at all is a hard-coded
+    answer and is reported too."""
     try:
         tree = sqlglot.parse_one(sql, read="sqlite")
     except Exception:  # noqa: BLE001 (unparseable: nothing to say; the database judged correctness)
@@ -168,10 +178,12 @@ def foreign_literals(sql: str, gold_sql: str, question: str, evidence: str | Non
         parent = lit.parent
         while isinstance(parent, (exp.Neg, exp.Paren, exp.Cast)):
             parent = parent.parent
-        if not isinstance(parent, _FILTERS):
-            continue
         key = _norm_literal(lit)
-        if key in gold:
+        if key in gold or isinstance(parent, (exp.Limit, exp.Offset)):
+            continue
+        if not isinstance(parent, _FILTERS):
+            if not lit.is_string and key not in numbers and abs(_as_float(lit.this)) > 100:
+                out.append(lit.sql(dialect="sqlite"))
             continue
         if lit.is_string:
             core = key.strip("%_")

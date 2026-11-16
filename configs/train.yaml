@@ -98,3 +98,46 @@ dpo:
   save_every: 25
   eval_every: 50
   seed: 0
+
+rl:
+  # Reinforcement learning with an execution reward (GRPO-style), from a finished SFT adapter (LoRA
+  # settings, gradient checkpointing, clipping and the GPU check come from `sft`). Planned 2026-11-16.
+  # An iteration: `questions_per_iter` new train questions (never the validation databases), `samples`
+  # answers each from the current model (vLLM, temperature 1: exactly the model's distribution), every
+  # answer executed and scored, then one pass of policy-gradient updates on those answers.
+  iterations: 16
+  questions_per_iter: 128
+  samples: 8
+  max_tokens: 512
+  reward:
+    # Wrong, failing, cut-off or without SQL: 0. Also 0 (and counted): a first-row pick that gold does
+    # not use (`x = (SELECT ...)` with a subquery that can return several rows, LIMIT without ORDER BY)
+    # and constants found nowhere in the question, evidence or gold (pool/quality.py). These matched
+    # gold in the pilot only by luck and cost strong DPO accuracy on dev.
+    # Correct: 1 + eff_weight * e / eff_clip with e = log2((gold_steps + smooth) / (steps + smooth))
+    # clipped to [-eff_clip, eff_clip]: between 0.5 (4x costlier than gold) and 1.5 (4x cheaper), so a
+    # correct answer always beats a wrong one. smooth (steps) keeps tiny queries from counting as wins.
+    eff_weight: 0.5
+    eff_clip: 2.0
+    smooth_steps: 100
+  # Execution while training (correctness as in screening, step counting capped at this x gold).
+  exec_timeout_s: 10
+  count_timeout_s: 60
+  step_cap_factor: 20
+  # Policy update: advantage = reward - mean reward of the question's answers (no division by the
+  # standard deviation, so tiny cost differences are not blown up); questions whose answers all score
+  # the same give no signal and are skipped. Clipped ratio loss (PPO), averaged over answer tokens.
+  # No KL term: correctness is in the reward, and validation decides whether the result is kept.
+  lr: 1.0e-5
+  warmup_steps: 2
+  questions_per_step: 16
+  clip_eps: 0.2
+  # A question's answers share its prompt in one sequence, cut so that no sequence has more answer tokens
+  # than this (bounds the memory of the vocabulary-sized log probabilities; results are identical).
+  max_answer_tokens_per_seq: 2048
+  # vLLM runs alone on the GPU in its own process (the trainer runs after it, in another process).
+  gpu_memory_utilization: 0.85
+  # Pilot (`rl --pilot`): measures time per phase and reward movement, projects the full run's cost.
+  pilot: {iterations: 2, questions_per_iter: 32}
+  keep_iterations: 2
+  seed: 0

@@ -9,6 +9,8 @@
   select    the method selection rule over several trained runs
   winner    print the selected run, arm and tag
   report    results table over models and splits from saved evaluations (R-VES, VES, paired tests)
+  rl        reinforcement learning with an execution reward from a finished adapter (resumable; --pilot
+            measures the cost first)
 """
 
 from __future__ import annotations
@@ -138,6 +140,22 @@ def cmd_report(a: argparse.Namespace) -> None:
         (paths.run_dir(a.out) / "report.txt").write_text(text + "\n", encoding="utf-8")
 
 
+def cmd_rl(a: argparse.Namespace) -> None:
+    from effsql.train.rl import format_summary, run_rl
+
+    s = run_rl(a.run, a.init_from, pilot=a.pilot, workers=a.workers)
+    print(format_summary(s))
+
+
+def cmd_rl_step(a: argparse.Namespace) -> None:
+    from effsql.train import rl
+
+    if a.step == "gen":
+        print(json.dumps(rl.gen_iter(a.run, a.iter), indent=2, default=str))
+    else:
+        print(json.dumps(rl.train_iter(a.run, a.iter), indent=2, default=str))
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="python -m effsql.train", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -199,6 +217,17 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--labels", help="comma list run=label for shorter names")
     p.add_argument("--out", help="run name to save report.json and report.txt in")
     p.set_defaults(func=cmd_report)
+    p = sub.add_parser("rl")
+    p.add_argument("--run", required=True)
+    p.add_argument("--init-from", required=True, help="finished SFT (or DPO) run whose adapter RL starts from")
+    p.add_argument("--pilot", action="store_true", help="train.yaml rl.pilot settings; projects the full run's cost")
+    p.add_argument("--workers", type=int, help="processes executing answers (default: all CPUs)")
+    p.set_defaults(func=cmd_rl)
+    p = sub.add_parser("rl-step", help="one GPU step of an RL iteration (started by `rl` in its own process)")
+    p.add_argument("step", choices=["gen", "train"])
+    p.add_argument("--run", required=True)
+    p.add_argument("--iter", type=int, required=True)
+    p.set_defaults(func=cmd_rl_step)
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S")
     args.func(args)

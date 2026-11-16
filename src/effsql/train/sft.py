@@ -212,20 +212,19 @@ def plan_steps(examples: list[TrainExample], ga: int, pack_size: int, seed: int)
     return [steps[j] for j in rng.permutation(len(steps))]
 
 
-def group_losses(model: Any, group: list[TrainExample], device: str) -> list[Any]:
-    """Per-question mean cross entropy over the answer tokens, for a group sharing a prompt prefix:
-    one forward pass over [prefix, rest of question 1, rest of question 2, ...]. Each question
-    attends only to the prefix and to itself and keeps the positions it has when alone, so each loss
-    equals the loss of that question in its own sequence."""
+def group_token_logps(model: Any, group: list[TrainExample], device: str) -> list[Any]:
+    """Log probability of every answer token, per question, for a group sharing a prompt prefix: one
+    forward pass over [prefix, rest of question 1, rest of question 2, ...]. Each question attends only
+    to the prefix and to itself and keeps the positions it has when alone, so each value equals the one
+    computed for that question in its own sequence."""
     import torch
-    import torch.nn.functional as F
 
     if len(group) == 1:
         ex = group[0]
         ids = torch.tensor([ex.input_ids], device=device)
         k = ex.n_target
-        logits = model(input_ids=ids, logits_to_keep=k + 1, use_cache=False).logits[:, :-1, :].float()
-        return [F.cross_entropy(logits.reshape(-1, logits.size(-1)), ids[:, -k:].reshape(-1))]
+        logits = model(input_ids=ids, logits_to_keep=k + 1, use_cache=False).logits[0, :-1, :].float()
+        return [torch.log_softmax(logits, -1).gather(-1, ids[0, -k:, None])[:, 0]]
 
     p = shared_prefix_len(group)
     ids, pos, seg, keep, labels, spans = list(group[0].input_ids[:p]), list(range(p)), [0] * p, [], [], []
@@ -247,9 +246,13 @@ def group_losses(model: Any, group: list[TrainExample], device: str) -> list[Any
     mask = (causal & visible)[None, None]
     out = model(input_ids=torch.tensor([ids], device=device), position_ids=torch.tensor([pos], device=device),
                 attention_mask=mask, logits_to_keep=torch.tensor(keep, device=device), use_cache=False)
-    logits = out.logits[0].float()
-    lab = torch.tensor(labels, device=device)
-    return [F.cross_entropy(logits[a:b], lab[a:b]) for a, b in spans]
+    lp = torch.log_softmax(out.logits[0].float(), -1).gather(-1, torch.tensor(labels, device=device)[:, None])[:, 0]
+    return [lp[a:b] for a, b in spans]
+
+
+def group_losses(model: Any, group: list[TrainExample], device: str) -> list[Any]:
+    """Per-question mean cross entropy over the answer tokens (see group_token_logps)."""
+    return [-x.mean() for x in group_token_logps(model, group, device)]
 
 
 def val_groups(examples: list[TrainExample], pack_size: int, seed: int) -> list[list[int]]:
