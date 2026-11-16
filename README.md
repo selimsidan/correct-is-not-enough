@@ -52,6 +52,8 @@ Paths are set in [configs/paths.yaml](configs/paths.yaml) and two env vars:
 | `11_search` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/11_search.ipynb) |
 | `32_rl` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/32_rl.ipynb) |
 | `33_rl_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/33_rl_evaluate.ipynb) |
+| `34_rl_eff` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/34_rl_eff.ipynb) |
+| `35_rl_eff_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/35_rl_eff_evaluate.ipynb) |
 | `40_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/40_evaluate.ipynb) |
 | `50_analysis` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/50_analysis.ipynb) |
 
@@ -177,6 +179,10 @@ python -m effsql.train rl --run rl_v1 --init-from sft_v1_best_e1                
 ```
 
 Settings in the `rl` section of [train.yaml](configs/train.yaml).
+
+Efficiency phase (notebooks 34, 35): `rl --settings rl_eff` continues from the kept RL model on the
+questions where efficiency can be learned (a strictly usable pool query at most 0.9x gold's cost, or correct
+RL answers that differed in cost), with 16 answers per question and a cost reward saturating at 2x.
 
 ### Compute and cost
 

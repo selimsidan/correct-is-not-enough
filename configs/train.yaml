@@ -108,6 +108,8 @@ rl:
   # 24 x 128 = 3,072 questions (2026-11-16, after the pilot: about 7.5 minutes per iteration on an A100).
   iterations: 24
   questions_per_iter: 128
+  # all: every train question with a usable gold; focus: only those in `focus` (see rl_eff).
+  questions: all
   samples: 8
   max_tokens: 512
   reward:
@@ -149,3 +151,18 @@ rl:
   pilot: {iterations: 2, questions_per_iter: 32}
   keep_iterations: 2
   seed: 0
+
+rl_eff:
+  # Efficiency phase (`rl --settings rl_eff`; planned 2026-11-16): overrides of `rl`. In rl_v1 accuracy
+  # rose (dev EX +3.7) but cost did not move: a question teaches efficiency only when the model's correct
+  # answers to it differ in cost, which was rare, so most of the signal was correctness. Here:
+  # only questions where efficiency can be learned (strictly usable pool query at most 0.9 x gold's cost:
+  # 1,684 questions; or correct rl_v1 answers 10% apart in cost: 450; together 1,953), 16 answers per
+  # question (more chances to differ in cost), and a reward that saturates at 2x instead of 4x: a correct
+  # answer scores 0.1 at 2x gold's cost, 1 at gold's cost, 1.9 at half (twice as steep as rl_v1).
+  questions: focus
+  focus: {pool_run: pool_v1, max_rel_cost: 0.9, history_runs: [rl_v1], min_spread: 1.1}
+  iterations: 15
+  samples: 16
+  reward: {eff_clip: 1.0}
+  snapshot_every: 5

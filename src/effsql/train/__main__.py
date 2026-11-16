@@ -143,7 +143,7 @@ def cmd_report(a: argparse.Namespace) -> None:
 def cmd_rl(a: argparse.Namespace) -> None:
     from effsql.train.rl import format_summary, run_rl
 
-    s = run_rl(a.run, a.init_from, pilot=a.pilot, workers=a.workers)
+    s = run_rl(a.run, a.init_from, pilot=a.pilot, workers=a.workers, settings=a.settings)
     print(format_summary(s))
 
 
@@ -222,6 +222,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--init-from", required=True, help="finished SFT (or DPO) run whose adapter RL starts from")
     p.add_argument("--pilot", action="store_true", help="train.yaml rl.pilot settings; projects the full run's cost")
     p.add_argument("--workers", type=int, help="processes executing answers (default: all CPUs)")
+    p.add_argument("--settings", help="train.yaml section whose values override `rl` (e.g. rl_eff)")
     p.set_defaults(func=cmd_rl)
     p = sub.add_parser("rl-step", help="one GPU step of an RL iteration (started by `rl` in its own process)")
     p.add_argument("step", choices=["gen", "train"])

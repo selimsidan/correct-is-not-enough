@@ -84,15 +84,48 @@ def _write_jsonl_atomic(path: Path, recs: list[dict[str, Any]]) -> None:
 
 
 # Setup ------------------------------------------------------------------------------------------
-def rl_settings(cfg: dict[str, Any], pilot: bool) -> dict[str, Any]:
+def rl_settings(cfg: dict[str, Any], pilot: bool, settings: str | None = None) -> dict[str, Any]:
+    """train.yaml `rl`, with the overrides of another section (e.g. `rl_eff`; nested dicts are merged)
+    and, for a pilot, `rl.pilot`."""
     rl = {k: v for k, v in cfg["rl"].items() if k != "pilot"}
+    for k, v in (cfg[settings] if settings else {}).items():
+        rl[k] = {**rl[k], **v} if isinstance(v, dict) and isinstance(rl.get(k), dict) else v
     if pilot:
         rl.update(cfg["rl"]["pilot"])
     return rl
 
 
+def focus_questions(paths: Paths, focus: dict[str, Any], candidates: set[str]) -> set[str]:
+    """Questions where efficiency can be learned:
+      pool_run: a correct query of the pool costs at most max_rel_cost x gold (quality ok or verified,
+        no first-row pick: the strict rule);
+      history_runs: in an earlier RL run, the model's correct answers to the question differed in cost
+        by at least min_spread (max / min)."""
+    import pandas as pd
+
+    from effsql.pool.quality import analyze
+
+    out: set[str] = set()
+    if focus.get("pool_run"):
+        df = pd.read_parquet(paths.run_dir(focus["pool_run"], create=False) / "pool_train.parquet",
+                             columns=["qid", "is_gold", "correct", "quality", "steps_capped", "rel_cost", "sql_original"])
+        df = df[df["qid"].isin(candidates) & df["correct"] & ~df["is_gold"] & df["quality"].isin(["ok", "verified"])
+                & ~df["steps_capped"] & df["rel_cost"].notna() & (df["rel_cost"] <= focus["max_rel_cost"])]
+        for q, sql in zip(df["qid"], df["sql_original"]):
+            if q not in out and not analyze(sql)["flags"]:
+                out.add(q)
+    for run in focus.get("history_runs") or []:
+        for f in sorted((paths.run_dir(run, create=False) / "iters").glob("*/rewards.jsonl")):
+            for r in read_jsonl(f):
+                rc = [x for x, st in zip(r["rel_cost"], r["status"]) if st == CORRECT and x]
+                if len(rc) >= 2 and max(rc) / min(rc) >= focus["min_spread"]:
+                    out.add(r["qid"])
+    return out & candidates
+
+
 def setup(run: str, init_from: str, *, paths: Paths, cfg: dict[str, Any], gen_cfg: dict[str, Any],
-          exec_cfg: dict[str, Any], pilot: bool = False, workers: int | None = None) -> dict[str, Any]:
+          exec_cfg: dict[str, Any], pilot: bool = False, workers: int | None = None,
+          settings: str | None = None) -> dict[str, Any]:
     """rl_meta.json: the settings (fingerprint) and the ordered train questions, fixed on the first call."""
     from effsql.measure.gold import ensure_gold_costs
     from effsql.train.sft import base_model_cfg
@@ -107,8 +140,8 @@ def setup(run: str, init_from: str, *, paths: Paths, cfg: dict[str, Any], gen_cf
                            f"{model_cfg.get('revision')!r}")
     if imeta["arm"] == "tagged" and not imeta.get("tag"):
         raise ValueError(f"{init_from} is a tagged model without a fixed efficiency target")
-    rl = rl_settings(cfg, pilot)
-    fp = {"init_from": init_from, "base_revision": model_cfg.get("revision"), "rl": rl,
+    rl = rl_settings(cfg, pilot, settings)
+    fp = {"init_from": init_from, "base_revision": model_cfg.get("revision"), "rl": rl, "settings": settings,
           "max_prompt_tokens": cfg["prompt"]["max_prompt_tokens"], "rl_version": RL_VERSION}
     path = run_dir / "rl_meta.json"
     if path.exists():
@@ -121,8 +154,14 @@ def setup(run: str, init_from: str, *, paths: Paths, cfg: dict[str, Any], gen_cf
     cands = [e for e in load_examples("train", paths) if e.db_id not in set(held)]
     golds = ensure_gold_costs("train", {e.qid: (e.db_id, e.gold_sql) for e in cands}, paths, exec_cfg, workers)
     ok = sorted(e.qid for e in cands if golds[e.qid]["gold_status"] == "ok" and golds[e.qid].get("vm_steps") is not None)
+    if rl.get("questions", "all") == "focus":
+        ok = sorted(focus_questions(paths, rl["focus"], set(ok)))
+    need = rl["iterations"] * rl["questions_per_iter"]
+    if len(ok) < need:  # the last iterations get fewer questions
+        log.warning("%d questions available, %d iterations of %d would use %d", len(ok), rl["iterations"],
+                    rl["questions_per_iter"], need)
     rng = np.random.default_rng(stable_seed(rl["seed"], "rl_questions"))
-    order = [ok[i] for i in rng.permutation(len(ok))][: rl["iterations"] * rl["questions_per_iter"]]
+    order = [ok[i] for i in rng.permutation(len(ok))][:need]
     meta = {"fingerprint": fp, "init_from": init_from, "arm": imeta["arm"], "tag": imeta.get("tag"),
             "epoch": imeta.get("epoch"), "export_run": imeta["export_run"], "holdout_db_ids": held,
             "n_questions_available": len(ok), "questions": order, "pilot": pilot}
@@ -560,13 +599,14 @@ def subprocess_step(step: str, run: str, k: int) -> None:
 def run_rl(run: str, init_from: str, *, pilot: bool = False, paths: Paths | None = None,
            cfg: dict[str, Any] | None = None, gen_cfg: dict[str, Any] | None = None,
            exec_cfg: dict[str, Any] | None = None, workers: int | None = None,
-           step_runner: Callable[[str, str, int], None] | None = None) -> dict[str, Any]:
+           step_runner: Callable[[str, str, int], None] | None = None, settings: str | None = None) -> dict[str, Any]:
     paths = paths or load_paths()
     cfg = cfg or load_config("train.yaml")
     gen_cfg = gen_cfg or load_config("generate.yaml")
     exec_cfg = exec_cfg or load_config("evaluate.yaml")["exec"]
     step_runner = step_runner or subprocess_step
-    meta = setup(run, init_from, paths=paths, cfg=cfg, gen_cfg=gen_cfg, exec_cfg=exec_cfg, pilot=pilot, workers=workers)
+    meta = setup(run, init_from, paths=paths, cfg=cfg, gen_cfg=gen_cfg, exec_cfg=exec_cfg, pilot=pilot, workers=workers,
+                 settings=settings)
     run_dir = paths.run_dir(run)
     n_iters = meta["fingerprint"]["rl"]["iterations"]
     log.info("rl %s from %s: %d iterations of %d questions (%d available)", run, init_from, n_iters,

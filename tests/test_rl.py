@@ -16,10 +16,12 @@ from effsql.train.data import target_completion
 from effsql.train.rl import (
     advantages,
     answer_chunks,
+    focus_questions,
     gen_iter,
     iter_dir,
     ppo_terms,
     reward,
+    rl_settings,
     run_rl,
     train_iter,
 )
@@ -141,6 +143,24 @@ def test_rl_end_to_end(setup):  # noqa: F811 (the fixture from test_sft)
     with pytest.raises(RuntimeError, match="new run name"):
         run_rl("R", "S", paths=p, cfg=other, gen_cfg=gen_cfg, workers=1, step_runner=runner)
 
+    # Efficiency phase: questions where the model's correct answers differed in cost (movies: count(*)
+    # and the self-join), or where the pool knows a query at most 0.9 x gold (none in the fixture).
+    f = {"pool_run": "pool", "max_rel_cost": 0.9, "history_runs": ["R"], "min_spread": 1.1}
+    assert focus_questions(p, f, {"train_0", "train_1", "train_2"}) == {"train_0"}
+    assert focus_questions(p, {**f, "history_runs": []}, {"train_0", "train_1", "train_2"}) == set()
+
     pilot = run_rl("P", "S", pilot=True, paths=p, cfg=cfg, gen_cfg=gen_cfg, workers=1, step_runner=runner)
     assert pilot["iterations_done"] == 1 and pilot["projection"]["iterations"] == 2
     assert pilot["projection"]["hours"] > 0
+
+
+def test_settings_override():
+    from effsql.config import load_config
+
+    cfg = load_config("train.yaml")
+    base, eff = rl_settings(cfg, False), rl_settings(cfg, False, "rl_eff")
+    assert base["questions"] == "all" and eff["questions"] == "focus" and eff["samples"] == 16
+    assert eff["reward"] == {**base["reward"], "eff_clip": 1.0} and eff["lr"] == base["lr"]
+    assert reward("correct", 0, 1e9, eff["reward"]) == pytest.approx(1.9)       # 2x cheaper and more
+    assert reward("correct", 1e9, 0, eff["reward"]) == pytest.approx(0.1)       # 2x costlier and more
+    assert rl_settings(cfg, True, "rl_eff")["iterations"] == cfg["rl"]["pilot"]["iterations"]
