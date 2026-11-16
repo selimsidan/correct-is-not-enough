@@ -604,7 +604,12 @@ def run_rl(run: str, init_from: str, *, pilot: bool = False, paths: Paths | None
     cfg = cfg or load_config("train.yaml")
     gen_cfg = gen_cfg or load_config("generate.yaml")
     exec_cfg = exec_cfg or load_config("evaluate.yaml")["exec"]
-    step_runner = step_runner or subprocess_step
+    if step_runner is None:  # the real run: generation and training need a GPU
+        if not shutil.which("nvidia-smi") or subprocess.run(["nvidia-smi"], check=False,
+                                                                    capture_output=True).returncode != 0:
+            raise RuntimeError("this runtime has no GPU: Runtime > Change runtime type > A100, then run the notebook "
+                               "again (finished work is kept)")
+        step_runner = subprocess_step
     meta = setup(run, init_from, paths=paths, cfg=cfg, gen_cfg=gen_cfg, exec_cfg=exec_cfg, pilot=pilot, workers=workers,
                  settings=settings)
     run_dir = paths.run_dir(run)
