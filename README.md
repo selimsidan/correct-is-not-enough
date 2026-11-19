@@ -54,6 +54,8 @@ Paths are set in [configs/paths.yaml](configs/paths.yaml) and two env vars:
 | `33_rl_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/33_rl_evaluate.ipynb) |
 | `34_rl_eff` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/34_rl_eff.ipynb) |
 | `35_rl_eff_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/35_rl_eff_evaluate.ipynb) |
+| `36_reference_models` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/36_reference_models.ipynb) |
+| `37_reference_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/37_reference_evaluate.ipynb) |
 | `40_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/40_evaluate.ipynb) |
 | `50_analysis` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/50_analysis.ipynb) |
 
@@ -183,6 +185,18 @@ Settings in the `rl` section of [train.yaml](configs/train.yaml).
 Efficiency phase (notebooks 34, 35): `rl --settings rl_eff` continues from the kept RL model on the
 questions where efficiency can be learned (a strictly usable pool query at most 0.9x gold's cost, or correct
 RL answers that differed in cost), with 16 answers per question and a cost reward saturating at 2x.
+
+### Reference models (notebooks 36, 37)
+
+Published models run in our harness, for comparison only (nothing is trained or chosen with them):
+OmniSQL-7B, Arctic-Text2SQL-R1-7B, Qwen2.5-Coder-32B-Instruct (AWQ) and our base model with OmniSQL's prompt.
+Each gets the prompt it was published with (OmniSQL's schema format, Arctic's `<think>` prompt; settings in
+[reference.yaml](configs/reference.yaml)); predictions are scored by `effsql evaluate` like ours, so accuracy
+and query cost are directly comparable.
+
+```bash
+python -m effsql.gen.reference --model arctic7b          # GPU; writes runs/ref_arctic7b, dev and mini-dev
+```
 
 ### Compute and cost
 

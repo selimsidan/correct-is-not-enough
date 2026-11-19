@@ -1,0 +1,53 @@
+# Published models on dev and mini-dev in our harness (python -m effsql.gen.reference), for comparison only.
+# Each model gets the prompt it was published with (style, see gen/reference.py); all answer greedily.
+# All are public on Hugging Face under Apache-2.0; the exact commit is resolved and recorded.
+models:
+  # The model OmniSQL starts from, with OmniSQL's prompt: its published BIRD dev score (50.9) uses this prompt;
+  # our zero-shot run of the same model uses ours (53.9).
+  qwen7b_omnisql:
+    id: Qwen/Qwen2.5-Coder-7B-Instruct
+    style: omnisql
+    max_tokens: 2048          # OmniSQL's infer.py
+    max_prompt_tokens: 8192
+    revision: null
+    dtype: bfloat16
+    max_model_len: 16384
+    gpu_memory_utilization: 0.90
+    enable_prefix_caching: true
+  # Qwen2.5-Coder-7B-Instruct fully fine-tuned on 2.5 million synthetic examples plus BIRD and Spider train,
+  # answers with reasoning. Published BIRD dev 63.9 (greedy).
+  omnisql7b:
+    id: seeklhy/OmniSQL-7B
+    style: omnisql
+    max_tokens: 2048
+    max_prompt_tokens: 8192
+    revision: null
+    dtype: bfloat16
+    max_model_len: 16384
+    gpu_memory_utilization: 0.90
+    enable_prefix_caching: true
+  # GRPO with an execution reward, starting from OmniSQL; answers with reasoning. Published BIRD dev 68.9.
+  arctic7b:
+    id: Snowflake/Arctic-Text2SQL-R1-7B
+    style: arctic
+    max_tokens: 8192          # Arctic's infer.py
+    max_prompt_tokens: 8192
+    revision: null
+    dtype: bfloat16
+    max_model_len: 16384
+    gpu_memory_utilization: 0.90
+    enable_prefix_caching: true
+  # The 32B model of the same family, untuned, with our zero-shot prompt. 4-bit AWQ (19.3 GB) to fit a 40 GB
+  # A100; published BIRD dev 64.5 is for the full-precision model with OmniSQL's prompt.
+  qwen32b:
+    id: Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
+    style: effsql
+    max_tokens: 512           # as for our models (generate.yaml greedy)
+    max_prompt_tokens: 12000  # as for our models (generate.yaml)
+    revision: null
+    dtype: auto
+    max_model_len: 16384
+    gpu_memory_utilization: 0.92
+    enable_prefix_caching: true
+chunk_size: 256
+seed: 0
