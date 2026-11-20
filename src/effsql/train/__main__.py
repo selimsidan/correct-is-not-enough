@@ -10,7 +10,9 @@
   winner    print the selected run, arm and tag
   report    results table over models and splits from saved evaluations (R-VES, VES, paired tests)
   rl        reinforcement learning with an execution reward from a finished adapter (resumable; --pilot
-            measures the cost first)
+            measures the cost first; --settings own_answers only samples and scores the model's answers)
+  pairs     preference pairs from the search's cheap targets and the model's own answers (CPU)
+  select-cost  the cost rule of "cost first, then accuracy": allowed on validation EX, lowest cost wins
 """
 
 from __future__ import annotations
@@ -156,6 +158,25 @@ def cmd_rl_step(a: argparse.Namespace) -> None:
         print(json.dumps(rl.train_iter(a.run, a.iter), indent=2, default=str))
 
 
+def cmd_pairs(a: argparse.Namespace) -> None:
+    from effsql.train.pairs import build_pairs
+
+    m = build_pairs(a.targets_run, a.run, own_run=a.own_run, chosen=a.chosen, rejected=a.rejected)
+    print(json.dumps(m["stats"], indent=2, default=str))
+
+
+def cmd_select_cost(a: argparse.Namespace) -> None:
+    from effsql.train.select import format_cost_table, select_cost
+
+    paths = load_paths()
+    runs = [a.ref] + [r for r in _csv(a.runs) if r != a.ref]
+    res = select_cost(a.ref, {r: paths.run_dir(f"{r}_val", create=False) for r in runs},
+                      out=paths.run_dir(a.out) / "selection.json")
+    text = format_cost_table(res)
+    (paths.run_dir(a.out) / "selection.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="python -m effsql.train", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -224,6 +245,18 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--workers", type=int, help="processes executing answers (default: all CPUs)")
     p.add_argument("--settings", help="train.yaml section whose values override `rl` (e.g. rl_eff)")
     p.set_defaults(func=cmd_rl)
+    p = sub.add_parser("pairs")
+    p.add_argument("--targets-run", required=True, help="search run holding cheap_targets_train.jsonl")
+    p.add_argument("--run", required=True, help="output (an export run for `dpo --export`)")
+    p.add_argument("--own-run", help="sampling run of the model's own answers (rl --settings own_answers)")
+    p.add_argument("--chosen", default="search", help="search (default), pool (no search) or gold (no generated queries)")
+    p.add_argument("--rejected", default="own", help="own (default) or pool (other models' queries)")
+    p.set_defaults(func=cmd_pairs)
+    p = sub.add_parser("select-cost")
+    p.add_argument("--ref", required=True, help="the current model (kept unless a candidate is cheaper)")
+    p.add_argument("--runs", required=True, help="comma list of candidate runs")
+    p.add_argument("--out", required=True, help="run name for selection.json and selection.txt")
+    p.set_defaults(func=cmd_select_cost)
     p = sub.add_parser("rl-step", help="one GPU step of an RL iteration (started by `rl` in its own process)")
     p.add_argument("step", choices=["gen", "train"])
     p.add_argument("--run", required=True)

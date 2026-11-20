@@ -166,3 +166,29 @@ rl_eff:
   samples: 16
   reward: {eff_clip: 1.0}
   snapshot_every: 5
+
+# Cost first, then accuracy (planned 2026-11-21; notebooks 70 to 77).
+# 1. The search (gen/search.py, run search_v1) gives each train question its cheapest usable correct query.
+# 2. own_answers: the current model's own answers to every train question, validation databases included
+#    (`rl --settings own_answers`: sampling and scoring only, no training).
+# 3. pairs: chosen = the cheap target, rejected = the model's own costlier correct answer (efficiency) or
+#    its own wrong answer (correctness). 4. DPO from the current model. 5. RL from the DPO model with the
+#    cheapest known query as the cost yardstick (`rl --settings rl_v2`).
+own_answers:
+  sample_only: true
+  include_holdout: true
+  questions_per_iter: 1024
+rl_v2:
+  reward: {yardstick: cheapest_known}
+  targets_run: search_v1
+  iterations: 16
+  snapshot_every: 8
+pairs:
+  # Per question, at most this many pairs; rejected answers are the most frequent distinct ones first
+  # (what the model writes most often), each used once.
+  efficiency_pairs: 3
+  correctness_pairs: 1
+  # Efficiency pair: the rejected answer costs at least min_ratio x the chosen one and min_abs_steps more.
+  min_ratio: 1.1
+  min_abs_steps: 50
+  seed: 0

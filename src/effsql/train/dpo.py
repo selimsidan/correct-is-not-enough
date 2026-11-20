@@ -183,6 +183,19 @@ def val_metrics(model: Any, examples: list[TrainExample], units: list[Unit], ref
     return pair_metrics(rows)
 
 
+def save_adapter(model: Any, dest: Any) -> None:
+    """The adapter to dest/adapter (written to a temporary folder first)."""
+    import shutil
+
+    adapter, tmp = dest / "adapter", dest / "adapter.tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    model.save_pretrained(str(tmp))
+    if adapter.exists():
+        shutil.rmtree(adapter)
+    tmp.replace(adapter)
+
+
 def train_dpo(export_run: str, run: str, init_from: str, *, tag: str | None = None, paths: Paths | None = None,
               cfg: dict[str, Any] | None = None, gen_cfg: dict[str, Any] | None = None, max_steps: int | None = None,
               device: str | None = None) -> dict[str, Any]:
@@ -220,8 +233,10 @@ def train_dpo(export_run: str, run: str, init_from: str, *, tag: str | None = No
     train_ex, train_units, tstats = build_units(read_export(export_dir, "dpo", "train"), arm, tag, tok, paths, budget)
     val_ex, val_units, vstats = build_units(read_export(export_dir, "dpo", "val"), arm, tag, tok, paths, budget)
     qps, pack, cap = d["questions_per_step"], int(d["pack_size"]), int(d["max_answers_per_seq"])
-    steps = [s for e in range(int(d.get("epochs", 1)))
-             for s in plan_steps(train_units, qps, pack, stable_seed(d["seed"], "dpo", e))]
+    per_epoch = [plan_steps(train_units, qps, pack, stable_seed(d["seed"], "dpo", e)) for e in range(int(d.get("epochs", 1)))]
+    steps = [s for ep in per_epoch for s in ep]
+    # with several epochs, the model after each earlier epoch is also kept as run <run>_e<k>
+    epoch_ends = {int(n): e + 1 for e, n in enumerate(np.cumsum([len(ep) for ep in per_epoch])[:-1])}
     full_steps = len(steps)
     n_steps = min(full_steps, max_steps) if max_steps else full_steps
     if n_steps == 0:
@@ -246,6 +261,13 @@ def train_dpo(export_run: str, run: str, init_from: str, *, tag: str | None = No
         append_jsonl(val_log, [{"step": 0, **val_metrics(model, val_ex, val_units, ref["val"], d, device)}])
     log.info("dpo from %s (%s, tag %s): %d questions, %d pairs %s; %d steps of %d questions, starting at %d on %s",
              init_from, arm, tag, tstats["n_questions"], tstats["n_pairs"], tstats["by_type"], n_steps, qps, start, device)
+
+    def adapter_meta(epochs: int, n_done: int) -> dict[str, Any]:
+        return {"arm": arm, "method": f"dpo-{arm}", "tag": tag, "epoch": imeta["epoch"], "export_run": imeta["export_run"],
+                "dpo_export_run": export_run, "init_from": init_from, "export_pool_sha256": emeta["pool_sha256"],
+                "base_id": model_cfg["id"], "base_revision": model_cfg.get("revision"), "beta": d["beta"],
+                "rpo_alpha": d["rpo_alpha"], "lr": d["lr"], "epochs": epochs, "n_steps": n_done, "gpu": gpu,
+                "train_pairs": tstats, "val_pairs": vstats, "dpo_version": DPO_VERSION}
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -285,6 +307,12 @@ def train_dpo(export_run: str, run: str, init_from: str, *, tag: str | None = No
                  rec["reward_acc"], rec["margin"], rec["lr"], rec["tokens_per_s"] or 0)
         if (step + 1) % d["save_every"] == 0:
             save_checkpoint(ckpt_dir, step + 1, model, opt, sched, fp, sft.get("keep_checkpoints", 2))
+        if step + 1 in epoch_ends and not max_steps:
+            snap = paths.run_dir(f"{run}_e{epoch_ends[step + 1]}")
+            save_adapter(model, snap)
+            write_json(snap / "adapter_meta.json", {**adapter_meta(epochs=epoch_ends[step + 1], n_done=step + 1),
+                                                    "complete": True, "snapshot_of": run})
+            log.info("model after epoch %d written to %s", epoch_ends[step + 1], snap)
         if (step + 1) % d["eval_every"] == 0:
             final_val = val_metrics(model, val_ex, val_units, ref["val"], d, device)
             append_jsonl(val_log, [{"step": step + 1, **final_val}])
@@ -295,19 +323,9 @@ def train_dpo(export_run: str, run: str, init_from: str, *, tag: str | None = No
         append_jsonl(val_log, [{"step": n_steps, **final_val}])
     if n_steps % d["save_every"]:
         save_checkpoint(ckpt_dir, n_steps, model, opt, sched, fp, sft.get("keep_checkpoints", 2))
-    adapter, tmp = run_dir / "adapter", run_dir / "adapter.tmp"
-    model.save_pretrained(str(tmp))
-    if adapter.exists():
-        import shutil
-
-        shutil.rmtree(adapter)
-    tmp.replace(adapter)
-    meta = {"arm": arm, "method": f"dpo-{arm}", "tag": tag, "epoch": imeta["epoch"], "export_run": imeta["export_run"],
-            "dpo_export_run": export_run, "init_from": init_from, "export_pool_sha256": emeta["pool_sha256"],
-            "base_id": model_cfg["id"], "base_revision": model_cfg.get("revision"), "beta": d["beta"],
-            "rpo_alpha": d["rpo_alpha"], "lr": d["lr"], "epochs": int(d.get("epochs", 1)), "n_steps": n_steps, "gpu": gpu, "train_pairs": tstats,
-            "val_pairs": vstats, "val_final": final_val, "tokens_this_session": tokens,
-            "complete": n_steps == full_steps, "dpo_version": DPO_VERSION}
+    save_adapter(model, run_dir)
+    meta = {**adapter_meta(epochs=int(d.get("epochs", 1)), n_done=n_steps), "val_final": final_val,
+            "tokens_this_session": tokens, "complete": n_steps == full_steps}
     write_json(run_dir / "adapter_meta.json", meta)
-    log.info("adapter written to %s", adapter)
+    log.info("adapter written to %s", run_dir / "adapter")
     return meta

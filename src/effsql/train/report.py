@@ -81,16 +81,17 @@ def format_report(rep: dict[str, Any], labels: dict[str, str] | None = None) -> 
         if any(m["vs_ref"] for m in s["models"].values()):
             lines.append(f"  against {name(rep['ref'])}, same questions:")
             lines.append(f"  {'model':<{w - 2}}{'R-VES diff':>11}{'p':>8}{'EX diff':>9}{'p':>8}"
-                         f"{'cheaper':>9}{'costlier':>10}{'p':>8}")
+                         f"{'cheaper':>9}{'costlier':>10}{'p':>8}{'cost ratio':>12}")
             ref_ex = s["models"][rep["ref"]]["ex"]
             for r, m in s["models"].items():
                 v = m["vs_ref"]
                 if v:
                     lines.append(f"  {name(r):<{w - 2}}{v['rves_diff']:>+11.2f}{v['p_rves']:>8.3f}"
                                  f"{m['ex'] - ref_ex:>+9.1f}{v['p_ex']:>8.3f}{v['cheaper']:>9}{v['costlier']:>10}"
-                                 f"{v['p_cost']:>8.3f}")
+                                 f"{v['p_cost']:>8.3f}{_f(v.get('cost_ratio'), '.3f'):>12}")
         lines.append("")
     lines.append("R-VES: BIRD's reward with step counts for seconds (gold = 100, wrong = 0); R-VES/EX: the same over "
                  "correct answers only; VES: 100 * sqrt(speed-up), unbounded, so a few extreme questions dominate it. "
-                 "cheaper/costlier: both correct, cost at least 10% lower / higher than the reference's.")
+                 "cheaper/costlier: both correct, cost at least 10% lower / higher than the reference's; cost ratio: geometric "
+                 "mean of the model's cost / the reference's on the questions both answer correctly.")
     return "\n".join(lines)

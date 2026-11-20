@@ -56,6 +56,14 @@ Paths are set in [configs/paths.yaml](configs/paths.yaml) and two env vars:
 | `35_rl_eff_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/35_rl_eff_evaluate.ipynb) |
 | `36_reference_models` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/36_reference_models.ipynb) |
 | `37_reference_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/37_reference_evaluate.ipynb) |
+| `70_search_full` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/70_search_full.ipynb) |
+| `71_own_answers_and_pairs` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/71_own_answers_and_pairs.ipynb) |
+| `72_dpo` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/72_dpo.ipynb) |
+| `73_dpo_check` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/73_dpo_check.ipynb) |
+| `74_rl` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/74_rl.ipynb) |
+| `75_choose_and_report` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/75_choose_and_report.ipynb) |
+| `76_ablations` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/76_ablations.ipynb) |
+| `77_ablations_report` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/77_ablations_report.ipynb) |
 | `40_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/40_evaluate.ipynb) |
 | `50_analysis` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/50_analysis.ipynb) |
 
@@ -197,6 +205,32 @@ and query cost are directly comparable.
 ```bash
 python -m effsql.gen.reference --model arctic7b          # GPU; writes runs/ref_arctic7b, dev and mini-dev
 ```
+
+### Cost first, then accuracy (notebooks 70 to 77)
+
+Why: training for cheaper queries failed in two ways. RL cannot find cheaper forms (the model's own answers
+to a question almost never differ in cost, so a cost reward has nothing to compare), and preference
+training moved the cost but lost accuracy, partly because its "cheaper correct" queries included first-row
+picks that match gold only by luck, and its rejected queries were ones the model would never write.
+
+The method, in order:
+1. **Cost-guided search** on every train question (`python -m effsql.gen.search --run search_v1 --model 7b`):
+   starting from the first pool, the cheapest *usable* correct query known per question
+   (`cheap_targets_train.jsonl`). Usable is strict: same result as gold, no first-row pick gold does not use,
+   no constant found nowhere in the question, evidence or gold.
+2. **The model's own answers**: the current model answers every train question 8 times, all executed
+   (`python -m effsql.train rl --settings own_answers`: sampling and scoring only).
+3. **Pairs** (`python -m effsql.train pairs`): chosen = the cheap target; rejected = the model's own correct
+   answer costing at least 10% more (efficiency) or its own wrong answer (correctness), most frequent first.
+4. **DPO** from the current model on these pairs (2 epochs; the model after epoch 1 is kept too).
+5. **RL** from the DPO model, with the cheapest known query as the cost yardstick of the reward
+   (`--settings rl_v2`) instead of gold.
+6. **Choice on validation** (`python -m effsql.train select-cost`, fixed before training): a model is
+   allowed unless its EX is significantly lower than the current model's (McNemar), then the lowest cost on
+   the questions both answer correctly wins (or the current model is kept). Dev and mini-dev are scored after.
+
+Ablations (DPO only): chosen = gold (no generated queries), chosen = the first pool only (no search),
+rejected = other models' pool queries (off-policy, as in the first DPO).
 
 ### Compute and cost
 

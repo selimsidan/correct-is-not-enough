@@ -24,6 +24,16 @@ Generation and training run in separate processes because vLLM and the training 
 40 GB A100 together. After the last iteration the adapter is copied to runs/<run>/adapter with
 adapter_meta.json, so `predict`, `eval-val`, `select` and `report` treat it like any other adapter.
 
+Two variants by settings (train.yaml, 2026-11-21):
+  sample_only   no training: every iteration samples with the starting adapter and is scored, nothing
+                else. With include_holdout the validation databases are sampled too. Used to collect the
+                model's own answers to every train question (the rejected answers of the DPO pairs).
+                The number of iterations follows from the questions (questions_per_iter each).
+  reward.yardstick: cheapest_known
+                the efficiency part of the reward compares an answer's cost with the cheapest usable
+                correct query known for the question (cheap_targets of the search run `targets_run`)
+                instead of gold's, so the reward points at what is known to be reachable.
+
 Resume: running the same command again continues with the first iteration that has no done.json; an
 interrupted step is redone from its inputs (at most one iteration of work is lost). The settings are
 fixed in rl_meta.json on the first call; other settings need a new run name.
@@ -64,10 +74,15 @@ def iter_dir(run_dir: Path, k: int) -> Path:
 
 
 def adapter_dir(paths: Paths, run: str, meta: dict[str, Any], k: int) -> Path:
-    """Adapter that generates iteration k: the starting SFT adapter, then the previous iteration's."""
-    if k == 0:
+    """Adapter that generates iteration k: the starting SFT adapter, then the previous iteration's
+    (sample_only: always the starting adapter)."""
+    if k == 0 or meta["fingerprint"]["rl"].get("sample_only"):
         return paths.run_dir(meta["init_from"], create=False) / "adapter"
     return iter_dir(paths.run_dir(run), k - 1) / "adapter"
+
+
+def n_iterations(meta: dict[str, Any]) -> int:
+    return int(meta.get("n_iterations") or meta["fingerprint"]["rl"]["iterations"])
 
 
 def iter_questions(meta: dict[str, Any], k: int) -> list[str]:
@@ -151,20 +166,24 @@ def setup(run: str, init_from: str, *, paths: Paths, cfg: dict[str, Any], gen_cf
                                "use a new run name")
         return saved
     held = sorted(read_json(paths.run_dir(imeta["export_run"], create=False) / "export_meta.json")["holdout_db_ids"])
-    cands = [e for e in load_examples("train", paths) if e.db_id not in set(held)]
+    cands = [e for e in load_examples("train", paths) if rl.get("include_holdout") or e.db_id not in set(held)]
     golds = ensure_gold_costs("train", {e.qid: (e.db_id, e.gold_sql) for e in cands}, paths, exec_cfg, workers)
     ok = sorted(e.qid for e in cands if golds[e.qid]["gold_status"] == "ok" and golds[e.qid].get("vm_steps") is not None)
     if rl.get("questions", "all") == "focus":
         ok = sorted(focus_questions(paths, rl["focus"], set(ok)))
-    need = rl["iterations"] * rl["questions_per_iter"]
-    if len(ok) < need:  # the last iterations get fewer questions
+    if rl.get("sample_only"):  # every question once
+        rl_iters = math.ceil(len(ok) / rl["questions_per_iter"])
+    else:
+        rl_iters = rl["iterations"]
+    need = rl_iters * rl["questions_per_iter"]
+    if len(ok) < need and not rl.get("sample_only"):  # the last iterations get fewer questions
         log.warning("%d questions available, %d iterations of %d would use %d", len(ok), rl["iterations"],
                     rl["questions_per_iter"], need)
     rng = np.random.default_rng(stable_seed(rl["seed"], "rl_questions"))
     order = [ok[i] for i in rng.permutation(len(ok))][:need]
     meta = {"fingerprint": fp, "init_from": init_from, "arm": imeta["arm"], "tag": imeta.get("tag"),
             "epoch": imeta.get("epoch"), "export_run": imeta["export_run"], "holdout_db_ids": held,
-            "n_questions_available": len(ok), "questions": order, "pilot": pilot}
+            "n_questions_available": len(ok), "questions": order, "pilot": pilot, "n_iterations": rl_iters}
     write_json(path, meta)
     return meta
 
@@ -305,6 +324,14 @@ def score_iter(run: str, k: int, *, paths: Paths | None = None, exec_cfg: dict[s
     rl = meta["fingerprint"]["rl"]
     rw = rl["reward"]
     gen = read_jsonl(d / "gen.jsonl")
+    yard: dict[str, int] = {}
+    if rw.get("yardstick", "gold") == "cheapest_known":
+        from effsql.gen.search import read_targets
+
+        yard = {q: int(t["vm_steps"]) for q, t in read_targets(paths, rl["targets_run"]).items()
+                if t.get("vm_steps") is not None}
+    elif rw.get("yardstick", "gold") != "gold":
+        raise ValueError(f"unknown reward yardstick {rw['yardstick']!r} (gold or cheapest_known)")
     examples = {e.qid: e for e in load_examples("train", paths)}
     golds = ensure_gold_costs("train", {g["qid"]: (examples[g["qid"]].db_id, examples[g["qid"]].gold_sql) for g in gen},
                               paths, exec_cfg, workers)
@@ -348,7 +375,9 @@ def score_iter(run: str, k: int, *, paths: Paths | None = None, exec_cfg: dict[s
     for g in gen:
         q = g["qid"]
         gs = golds[q]["vm_steps"]
-        row = {"qid": q, "iteration": k, "gold_steps": gs, "status": [], "steps": [], "rel_cost": [], "reward": []}
+        ys = min(gs, yard.get(q, gs))  # the yardstick: gold, or the cheapest known (never above gold)
+        row = {"qid": q, "iteration": k, "gold_steps": gs, "yardstick_steps": ys, "status": [], "steps": [],
+               "rel_cost": [], "reward": [], "sql": []}
         for a in g["answers"]:
             if a["finish_reason"] == "length":
                 x = {"status": "cut_off", "steps": None}
@@ -360,7 +389,8 @@ def score_iter(run: str, k: int, *, paths: Paths | None = None, exec_cfg: dict[s
             row["status"].append(x["status"])
             row["steps"].append(x["steps"])
             row["rel_cost"].append(rc)
-            row["reward"].append(reward(x["status"], x["steps"], gs, rw))
+            row["reward"].append(reward(x["status"], x["steps"], ys, rw))
+            row["sql"].append(a["sql"])
             statuses.append(x["status"])
             rewards.append(row["reward"][-1])
             if x["status"] == CORRECT and rc is not None:
@@ -542,7 +572,7 @@ def train_iter(run: str, k: int, *, paths: Paths | None = None, cfg: dict[str, A
     ckpt.with_suffix(".pt.tmp").replace(ckpt)
 
     # the finished model or a snapshot first: an iteration counts as done only after it
-    n_iters = rl["iterations"]
+    n_iters = n_iterations(meta)
     every = rl.get("snapshot_every")
     if k == n_iters - 1:
         write_model(run_dir, out, meta, model_cfg, k + 1, global_step, gpu)
@@ -613,9 +643,11 @@ def run_rl(run: str, init_from: str, *, pilot: bool = False, paths: Paths | None
     meta = setup(run, init_from, paths=paths, cfg=cfg, gen_cfg=gen_cfg, exec_cfg=exec_cfg, pilot=pilot, workers=workers,
                  settings=settings)
     run_dir = paths.run_dir(run)
-    n_iters = meta["fingerprint"]["rl"]["iterations"]
-    log.info("rl %s from %s: %d iterations of %d questions (%d available)", run, init_from, n_iters,
-             meta["fingerprint"]["rl"]["questions_per_iter"], meta["n_questions_available"])
+    n_iters = n_iterations(meta)
+    sample_only = bool(meta["fingerprint"]["rl"].get("sample_only"))
+    log.info("rl %s from %s: %d iterations of %d questions (%d available)%s", run, init_from, n_iters,
+             meta["fingerprint"]["rl"]["questions_per_iter"], meta["n_questions_available"],
+             ", sampling only" if sample_only else "")
     for k in range(n_iters):
         d = iter_dir(run_dir, k)
         if (d / "done.json").exists():
@@ -628,6 +660,10 @@ def run_rl(run: str, init_from: str, *, pilot: bool = False, paths: Paths | None
         t0 = time.time()
         score_iter(run, k, paths=paths, exec_cfg=exec_cfg, workers=workers)
         t["score_total_s"] = time.time() - t0
+        if sample_only:
+            write_json(d / "times.json", t)
+            write_json(d / "done.json", {"iteration": k, "sample_only": True, **sample_record(d)})
+            continue
         t0 = time.time()
         step_runner("train", run, k)
         t["train_total_s"] = time.time() - t0
@@ -635,12 +671,21 @@ def run_rl(run: str, init_from: str, *, pilot: bool = False, paths: Paths | None
     return summarize(run, paths=paths, cfg=cfg)
 
 
+def sample_record(d: Path) -> dict[str, Any]:
+    """Log line of a sampling-only iteration (from its score statistics)."""
+    score = read_json(d / "score_stats.json")
+    return {**{f"score_{a}": score.get(a) for a in ("pct_correct", "mean_reward", "correct_geomean_rel_cost",
+                                                    "correct_pct_2x_cheaper", "correct_pct_costlier_10pct")},
+            "status": score.get("status"), "n_questions": score.get("n_questions"),
+            "n_questions_with_signal": score.get("n_questions_with_signal")}
+
+
 def summarize(run: str, *, paths: Paths, cfg: dict[str, Any]) -> dict[str, Any]:
     """Per-iteration log, and for a pilot the projected time and cost of the full run."""
     run_dir = paths.run_dir(run)
     meta = read_json(run_dir / "rl_meta.json")
     rl = meta["fingerprint"]["rl"]
-    iters = [read_json(iter_dir(run_dir, k) / "done.json") for k in range(rl["iterations"])
+    iters = [read_json(iter_dir(run_dir, k) / "done.json") for k in range(n_iterations(meta))
              if (iter_dir(run_dir, k) / "done.json").exists()]
     out: dict[str, Any] = {"run": run, "iterations_done": len(iters), "iterations": iters}
     last = iter_dir(run_dir, len(iters) - 1) if iters else None

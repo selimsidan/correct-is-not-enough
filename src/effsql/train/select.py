@@ -67,16 +67,20 @@ def paired(a: dict[str, dict[str, Any]], b: dict[str, dict[str, Any]], qids: lis
     d = rb - ra
     p_rves = float(wilcoxon(d).pvalue) if np.any(d != 0) else 1.0
     cheaper = costlier = 0
+    ratios = []
     for q in qids:
         x, y = a[q], b[q]
         if x["correct"] and y["correct"] and x.get("rel_cost") and y.get("rel_cost"):
             r = y["rel_cost"] / x["rel_cost"]
+            ratios.append(r)
             cheaper += r < 1 - SAME
             costlier += r > 1 / (1 - SAME)
     return {
         "rves_diff": float(d.mean()), "p_rves": p_rves,
         "p_ex": mcnemar_p([bool(a[q]["correct"]) for q in qids], [bool(b[q]["correct"]) for q in qids]),
-        "cheaper": int(cheaper), "costlier": int(costlier),
+        "cheaper": int(cheaper), "costlier": int(costlier), "n_both_correct": len(ratios),
+        # geometric mean of b's cost / a's cost on the questions both answer correctly
+        "cost_ratio": float(np.exp(np.mean(np.log(ratios)))) if ratios else None,
         "p_cost": float(binomtest(cheaper, cheaper + costlier, 0.5).pvalue) if cheaper + costlier else 1.0,
     }
 
@@ -132,4 +136,48 @@ def format_table(res: dict[str, Any]) -> str:
                          f"{v['cheaper']:>9}{v['costlier']:>10}{v['p_cost']:>8.3f}")
     lines.append("(cheaper/costlier: questions both answer correctly where this model's query costs at least 10% "
                  "less / more than the winner's)")
+    return "\n".join(lines)
+
+
+def select_cost(ref: str, eval_dirs: dict[str, Path], alpha: float = 0.05, out: Path | None = None) -> dict[str, Any]:
+    """The rule of "cost first, then accuracy" (fixed 2026-11-21, before any of its models were trained),
+    on the validation databases against the current model `ref`:
+      1. Accuracy: a candidate is allowed unless its EX is lower than ref's with a significant exact
+         McNemar test (alpha 0.05).
+      2. Cost: among allowed candidates, the lowest cost relative to ref on the questions both answer
+         correctly (geometric mean of the ratio) wins, if it is below 1. Otherwise ref is kept.
+    eval_dirs: model name -> run dir holding eval_train.jsonl, ref included."""
+    recs = {m: latest_by(d / "eval_train.jsonl", where=is_current) for m, d in eval_dirs.items()}
+    missing = [m for m, r in recs.items() if not r]
+    if missing:
+        raise RuntimeError(f"no validation evaluation for {missing}")
+    qids = sorted(set.intersection(*(set(r) for r in recs.values())))
+    stats = {m: method_stats(r, qids) for m, r in recs.items()}
+    for m, st in stats.items():
+        v = None if m == ref else paired(recs[ref], recs[m], qids)
+        st["vs_ref"] = v
+        st["eligible"] = m != ref and not (st["ex"] < stats[ref]["ex"] and v["p_ex"] < alpha)
+    ok = [m for m in stats if stats[m]["eligible"] and stats[m]["vs_ref"]["cost_ratio"] is not None]
+    best = min(ok, key=lambda m: (stats[m]["vs_ref"]["cost_ratio"], -stats[m]["ex"], m)) if ok else None
+    winner = best if best is not None and stats[best]["vs_ref"]["cost_ratio"] < 1 else ref
+    res = {"n_questions": len(qids), "alpha": alpha, "ref": ref, "winner": winner, "methods": stats,
+           "rule": select_cost.__doc__.split("\n", 1)[1].split("eval_dirs:")[0].strip()}
+    if out:
+        write_json(out, res)
+    return res
+
+
+def format_cost_table(res: dict[str, Any]) -> str:
+    w = max(28, max(len(m) for m in res["methods"]) + 2)
+    lines = [(f"{'model':<{w}}{'EX':>7}{'EX diff':>9}{'p EX':>8}{'cost ratio':>12}{'cheaper':>9}{'costlier':>10}"
+              f"{'p':>8}{'>=2x cheaper':>14}{'geomean cost':>14}  allowed")]
+    for m, s in res["methods"].items():
+        v = s["vs_ref"] or {}
+        ref_ex = res["methods"][res["ref"]]["ex"]
+        lines.append(f"{m:<{w}}{s['ex']:>7.1f}{s['ex'] - ref_ex:>+9.1f}{_f(v.get('p_ex'), '.3f'):>8}"
+                     f"{_f(v.get('cost_ratio'), '.3f'):>12}{v.get('cheaper', '-'):>9}{v.get('costlier', '-'):>10}"
+                     f"{_f(v.get('p_cost'), '.3f'):>8}{s['cheap_2x']:>13.1f}%{_f(s['rel_cost_geomean'], '.3f'):>14}"
+                     f"  {'ref' if m == res['ref'] else ('yes' if s['eligible'] else 'no')}")
+    lines.append(f"winner: {res['winner']} ({res['n_questions']} validation questions; cost ratio = geometric mean of "
+                 f"this model's cost / {res['ref']}'s on questions both answer correctly)")
     return "\n".join(lines)

@@ -164,3 +164,62 @@ def test_settings_override():
     assert reward("correct", 0, 1e9, eff["reward"]) == pytest.approx(1.9)       # 2x cheaper and more
     assert reward("correct", 1e9, 0, eff["reward"]) == pytest.approx(0.1)       # 2x costlier and more
     assert rl_settings(cfg, True, "rl_eff")["iterations"] == cfg["rl"]["pilot"]["iterations"]
+
+
+def test_own_answers_and_yardstick(setup):  # noqa: F811 (the fixture from test_sft)
+    import json
+
+    p, cfg, gen_cfg = setup
+    train_sft("gold", "exp", "S", paths=p, cfg=cfg, gen_cfg=gen_cfg, device="cpu")
+    cfg["own_answers"] = {**cfg["own_answers"], "questions_per_iter": 2}
+    cfg["rl"].update(samples=4)
+    tok = load_tokenizer(gen_cfg["model"])
+    calls, steps = [], []
+
+    def runner(step, run, k):
+        steps.append((step, run, k))
+        assert step == "gen"                                          # sampling only: never a training step
+        gen_iter(run, k, paths=p, cfg=cfg, gen_cfg=gen_cfg, sampler=make_sampler(tok, calls))
+
+    run_rl("O", "S", paths=p, cfg=cfg, gen_cfg=gen_cfg, workers=1, step_runner=runner, settings="own_answers")
+    meta = read_json(p.run_dir("O") / "rl_meta.json")
+    assert meta["n_iterations"] == 2 and len(meta["questions"]) == 3 and steps == [("gen", "O", 0), ("gen", "O", 1)]
+    from effsql.train.rl import adapter_dir
+    assert adapter_dir(p, "O", meta, 1) == p.run_dir("S") / "adapter"   # always the starting model
+    rows = {r["qid"]: r for k in range(2) for r in read_jsonl(iter_dir(p.run_dir("O"), k) / "rewards.jsonl")}
+    assert rows["train_0"]["sql"][0] == "SELECT count(*) FROM movies" and rows["train_0"]["sql"][3] is None
+    assert (iter_dir(p.run_dir("O"), 1) / "done.json").exists()
+    assert not (p.run_dir("O") / "adapter").exists() and not (p.run_dir("O") / "rl_log.jsonl").exists()
+    run_rl("O", "S", paths=p, cfg=cfg, gen_cfg=gen_cfg, workers=1, step_runner=runner, settings="own_answers")
+    assert len(steps) == 2                                             # resume: nothing is redone
+
+    # Yardstick: a cheaper known query than gold for the question with the costliest gold (the fixture's
+    # tables are tiny): its correct answers now earn less; other questions keep gold as the yardstick.
+    q = max(rows, key=lambda x: rows[x]["gold_steps"])
+    gold_steps = rows[q]["gold_steps"]
+    assert gold_steps > 0
+    (p.run_dir("T") / "cheap_targets_train.jsonl").write_text(json.dumps(
+        {"qid": q, "vm_steps": 0, "search_version": 2}) + "\n")
+    cfg["yard"] = {"reward": {"yardstick": "cheapest_known"}, "targets_run": "T", "iterations": 1,
+                   "questions_per_iter": 3, "sample_only": True}
+    run_rl("Y", "S", paths=p, cfg=cfg, gen_cfg=gen_cfg, workers=1, step_runner=runner, settings="yard")
+    y = {r["qid"]: r for r in read_jsonl(iter_dir(p.run_dir("Y"), 0) / "rewards.jsonl")}
+    assert y[q]["yardstick_steps"] == 0 and all(y[o]["yardstick_steps"] == y[o]["gold_steps"] for o in y if o != q)
+    i = y[q]["status"].index("correct")
+    assert y[q]["reward"][i] < rows[q]["reward"][i]
+
+    # Pairs from these own answers, then DPO on them (the export format DPO reads).
+    from effsql.train.dpo import train_dpo
+    from effsql.train.pairs import build_pairs
+
+    (p.run_dir("T2") / "cheap_targets_train.jsonl").write_text(json.dumps(
+        {"qid": "train_0", "db_id": "movies", "sql": "SELECT max(id) + 1 FROM movies", "vm_steps": 0,
+         "gold_vm_steps": rows["train_0"]["gold_steps"], "source": "search:r1", "search_version": 2}) + "\n")
+    m = build_pairs("T2", "PX", own_run="O", sft_export="exp", pool_run="pool", paths=p, cfg=cfg["pairs"])
+    pairs = read_jsonl(p.run_dir("PX") / "data" / "dpo_train.jsonl")
+    assert {r["pair_type"] for r in pairs} == {"efficiency", "correctness"}
+    assert any("JOIN" in r["rejected_sql"] for r in pairs if r["pair_type"] == "efficiency")
+    assert m["stats"]["dpo_train"]["n_questions"] == 1
+    cfg["dpo"].update(questions_per_step=1, pack_size=1, save_every=1, eval_every=100, epochs=1)
+    d = train_dpo("PX", "DX", "S", paths=p, cfg=cfg, gen_cfg=gen_cfg, device="cpu")
+    assert d["complete"] and d["dpo_export_run"] == "PX" and d["train_pairs"]["n_pairs"] == len(pairs)

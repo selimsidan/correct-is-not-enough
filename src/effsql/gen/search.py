@@ -12,15 +12,22 @@ what an engineer would look at, and several tries:
     (correct = same result as gold under the official 30 s limit; then VM steps, capped at 50x
     gold like screening) and checked like the pool: the arbitrary-row-pick check of
     pool/quality.py and constants that appear nowhere in the question, evidence or gold.
-  "usable" = correct, quality ok or verified, no foreign constants. Only usable queries become the
-  next reference or count as found.
+  "usable" (the strict rule, as in the RL reward; version 2, 2026-11-21) = correct, cost counted, no
+  arbitrary-row-pick construct that gold does not use (a "first-row pick": `x = (SELECT ...)` with a
+  subquery that can return several rows, LIMIT without ORDER BY; about half of the pilot's 2x wins
+  were these) and no constants found nowhere in the question, evidence or gold. Only usable queries
+  become the next reference or count as found.
 
 The start is the base pool (pool_v1): its cheapest usable correct query per question, and its
 known candidates are not executed again. Outputs in runs/<run>/ (resumable at every step):
   search_targets_train.json     the questions (a pilot is a fixed random sample)
   search_gen_train.jsonl        model answers, one record per (question, round)
   search_exec_train.jsonl       one record per distinct new query
-  search_summary_train.json     headroom before and after every round, yield, throughput
+  search_summary_train.json     headroom before and after every round, yield, throughput, and at the end
+                                for the training and the validation questions separately
+  cheap_targets_train.jsonl     per question: the cheapest usable correct query known (gold, pool or
+                                search) and the cheapest from the base pool alone. Used by DPO (the
+                                chosen answers) and RL (the cost yardstick of the reward).
 """
 
 from __future__ import annotations
@@ -28,7 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any
 
 import numpy as np
@@ -50,7 +57,7 @@ from effsql.paths import Paths, load_paths
 from effsql.pool.quality import analyze, foreign_literals, verdict
 
 log = logging.getLogger(__name__)
-SEARCH_VERSION = 1
+SEARCH_VERSION = 2  # 2: the strict usable rule (first-row picks never usable)
 SPLIT = "train"
 CHUNK = 1000
 OK_QUALITY = ("ok", "verified", "gold")
@@ -61,15 +68,28 @@ def is_current_search(rec: dict[str, Any]) -> bool:
 
 
 # Start state from the base pool ----------------------------------------------------------------
+def strict_ok(sql: str, example: Any, gold_flags: set[str]) -> bool:
+    """No arbitrary-row-pick construct that gold does not use, no constant found nowhere in the
+    question, evidence or gold (the rule of the RL reward)."""
+    return not (set(analyze(sql)["flags"]) - gold_flags) and not foreign_literals(sql, example.gold_sql,
+                                                                                 example.question, example.evidence)
+
+
 def base_state(paths: Paths, base_run: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, dict[str, Any]]]]:
-    """(best, known): best usable correct query per question with gold ok; every known candidate per
-    question by canonical SQL (its correctness and cost, so a repeat is not executed again)."""
+    """(best, known): best usable correct query per question with gold ok (strict rule); every known
+    candidate per question by canonical SQL (its correctness and cost, so a repeat is not executed again)."""
     df = pd.read_parquet(paths.run_dir(base_run) / f"pool_{SPLIT}.parquet")
     df = df[df["gold_status"] == "ok"]
+    examples = {e.qid: e for e in load_examples(SPLIT, paths)}
+    gold_flags: dict[str, set[str]] = {}
     known: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     best: dict[str, dict[str, Any]] = {}
     for r in df.itertuples(index=False):
         usable = bool(r.correct) and r.quality in OK_QUALITY and not r.steps_capped and not pd.isna(r.rel_cost)
+        if usable and not r.is_gold and r.rel_cost < 1:  # only a query cheaper than gold can become the best
+            if r.qid not in gold_flags:
+                gold_flags[r.qid] = set(analyze(examples[r.qid].gold_sql)["flags"])
+            usable = strict_ok(r.sql_original, examples[r.qid], gold_flags[r.qid])
         rec = {"sql": r.sql_original, "correct": bool(r.correct), "usable": usable,
                "vm_steps": None if pd.isna(r.vm_steps) else int(r.vm_steps),
                "rel_cost": None if pd.isna(r.rel_cost) else float(r.rel_cost),
@@ -113,10 +133,10 @@ def attempt_note(rec: dict[str, Any], best_steps: int) -> str:
         return "runs, but returns a different result than the reference query"
     if rec.get("foreign_literals"):
         return f"uses constants that are not in the question or evidence: {', '.join(rec['foreign_literals'][:3])}"
+    if rec.get("vm_steps") is None:  # counting stopped at the cap
+        return "correct, but far more expensive than the reference"
     if not rec["usable"]:
         return "matches the result only because SQLite picks an arbitrary row (not a safe equivalent)"
-    if rec.get("vm_steps") is None:
-        return "correct, but far more expensive than the reference"
     return f"correct, but {rec['vm_steps']} steps: not cheaper than the reference ({best_steps})"
 
 
@@ -180,6 +200,7 @@ def execute_round(paths: Paths, run: str, round_: int, examples: dict[str, Any],
     log.info("search round %d: %d new distinct queries to execute, %d repeats of known ones", round_, len(todo),
              len(repeats))
     cap_factor = pool_cfg.get("candidate_step_cap_factor", 50)
+    gold_flags = {q: set(analyze(examples[q].gold_sql)["flags"]) for q in {r["qid"] for r in todo}}
 
     def is_correct(r: dict[str, Any]) -> bool:
         return bool(r["ok"] and hashes_match(r["result_hash"], golds[new[r["key"]]["qid"]]["result_hash"]))
@@ -214,7 +235,7 @@ def execute_round(paths: Paths, run: str, round_: int, examples: dict[str, Any],
                 rec.update(quality=v, quality_flags=a["flags"], foreign_literals=fl)
                 if x.get("vm_steps") is not None:
                     rec["rel_cost"] = rel_cost(x["vm_steps"], r["gold_vm_steps"], c)
-                    rec["usable"] = v in OK_QUALITY and not fl
+                    rec["usable"] = v in OK_QUALITY and not fl and not (set(a["flags"]) - gold_flags[r["qid"]])
             recs.append(rec)
         append_jsonl(out, recs)
         log.info("search round %d: %d queries executed", round_, len(recs))
@@ -321,7 +342,61 @@ def search(run: str, backend: Backend, *, cfg: dict[str, Any] | None = None, pat
         execs = list(latest_by(exec_path, key="cand_id", where=is_current_search).values())
         summ = summarize(run_dir, base_best, qids, execs, r, gen_stats, backend.model_id)
         log.info("search round %d done: %s", r, json.dumps(summ["rounds"][-1]))
+    execs = list(latest_by(exec_path, key="cand_id", where=is_current_search).values())
+    best, _ = state_after(base_best, execs, cfg["rounds"])
+    held = holdout_db_ids(paths, cfg)
+    summ["final"] = write_targets(run_dir, best, base_best, qids, {q: examples[q].db_id for q in qids}, held)
+    write_json(run_dir / f"search_summary_{SPLIT}.json", summ)
     return summ
+
+
+def holdout_db_ids(paths: Paths, cfg: dict[str, Any]) -> list[str]:
+    """The validation databases of the SFT export (never used for training)."""
+    f = paths.run_dir(cfg["pilot_exclude_export"], create=False) / "export_meta.json"
+    return sorted(read_json(f)["holdout_db_ids"]) if f.exists() else []
+
+
+def write_targets(run_dir: Any, best: dict[str, dict[str, Any]], base_best: dict[str, dict[str, Any]],
+                  qids: list[str], db_of: dict[str, str], held: list[str]) -> dict[str, Any]:
+    """cheap_targets_train.jsonl (one row per searched question) and the headroom of the training and the
+    validation questions: with the base pool alone and with the search."""
+    rows = []
+    for q in qids:
+        b, p = best[q], base_best[q]
+        rows.append({"qid": q, "db_id": db_of[q], "part": "val" if db_of[q] in held else "train",
+                     "sql": b["sql"], "vm_steps": b["vm_steps"], "gold_vm_steps": b["gold_vm_steps"],
+                     "rel_cost": b["rel_cost"], "source": b.get("source"),
+                     "pool_sql": p["sql"], "pool_vm_steps": p["vm_steps"], "pool_rel_cost": p["rel_cost"],
+                     "pool_source": p.get("source"), "search_version": SEARCH_VERSION})
+    path = run_dir / f"cheap_targets_{SPLIT}.jsonl"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+    tmp.replace(path)
+    out: dict[str, Any] = {"holdout_db_ids": held}
+    for part in ("train", "val"):
+        qs = [r["qid"] for r in rows if r["part"] == part]
+        if qs:
+            out[part] = {"pool_only": headroom(base_best, qs), "with_search": headroom(best, qs),
+                         "by_source": dict(Counter(source_kind(best[q].get("source")) for q in qs))}
+    return out
+
+
+def source_kind(source: Any) -> str:
+    """gold, pool (any base pool candidate) or search."""
+    s = str(source)
+    return "gold" if s == "gold" else "search" if s.startswith("search") else "pool"
+
+
+def read_targets(paths: Paths, run: str) -> dict[str, dict[str, Any]]:
+    """qid -> row of cheap_targets_train.jsonl of a finished search run."""
+    path = paths.run_dir(run, create=False) / f"cheap_targets_{SPLIT}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found: run the search (`python -m effsql.gen.search --run {run}`)")
+    rows = {r["qid"]: r for r in (json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip())}
+    old = [q for q, r in rows.items() if r.get("search_version") != SEARCH_VERSION]
+    if old:
+        raise RuntimeError(f"{len(old)} targets in {path} come from an older search version: rerun the search")
+    return rows
 
 
 def main(argv: list[str] | None = None) -> None:

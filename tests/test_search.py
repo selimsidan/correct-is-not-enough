@@ -9,7 +9,7 @@ from effsql.data.schema import build_schema_cache
 from effsql.data.stage import stage
 from effsql.gen.parse import parse_run
 from effsql.gen.sample import generate
-from effsql.gen.search import attempt_note, search
+from effsql.gen.search import attempt_note, read_targets, search
 from effsql.io import read_json, read_jsonl
 from effsql.pool.build import build_pool
 from effsql.pool.diversity import diversity
@@ -23,7 +23,8 @@ ANSWERS = {
          "SELECT count(*) FROM movies WHERE id >= 0",                         # correct, but a guessed constant
          "SELECT count(*) FROM movies a JOIN movies b ON a.id = b.id",        # correct, pricier
          "SELECT max(id) + 1 FROM movies"],                                   # correct and cheaper: usable
-        ["SELECT max(id) + 1 FROM movies", "SELECT max(rowid) + 1 FROM movies", "SELEC nonsense", "SELECT 20"],
+        ["SELECT max(id) + 1 FROM movies", "SELECT count(*) FROM movies LIMIT 1",  # a first-row pick: never usable
+         "SELEC nonsense", "SELECT 20"],
     ],
     "How many books?": [["SELECT count(id) FROM books"] * 4, ["SELECT count(*) FROM books"] * 4],
     "Max id?": [["SELECT id FROM movies ORDER BY id DESC LIMIT 1"] * 4, ["SELECT max(id) FROM movies"] * 4],
@@ -114,6 +115,16 @@ def test_search_rounds(pool, monkeypatch):
     assert hard["correct"] and hard["foreign_literals"] == ["(reads no table)"] and not hard["usable"]
     assert summ["rounds"][0]["n_questions_improved"] >= 1
     assert summ["rounds"][-1]["geomean_rel_cost"] < summ["start"]["geomean_rel_cost"]
+    pick = ex["SELECT count(*) FROM movies LIMIT 1"]
+    assert pick["correct"] and "unordered_limit" in pick["quality_flags"] and not pick["usable"]
+
+    # The cheap targets: per question the cheapest usable query (here the search's) and the pool's own.
+    t = read_targets(p, "srch")
+    assert set(t) == {"train_0", "train_1", "train_2"}
+    assert t["train_0"]["sql"] == "SELECT max(id) + 1 FROM movies" and t["train_0"]["source"] == "search:r1"
+    assert "JOIN" in t["train_0"]["pool_sql"] and t["train_0"]["pool_rel_cost"] == start["train_0"]
+    assert all(r["part"] == "train" for r in t.values())                # no SFT export here: no validation
+    assert summ["final"]["train"]["by_source"]["search"] >= 1
 
     # Round 2 prompt for movies: the cheaper query is the reference, earlier attempts with reasons.
     r2 = [u for u in fb.prompts if "How many movies?" in u and "Earlier attempts" in u]
@@ -142,5 +153,5 @@ def test_pilot_targets_fixed(pool):
 
 def test_attempt_note():
     assert "fails (syntax)" in attempt_note({"correct": False, "error_type": "syntax", "error_msg": "near x"}, 10)
-    assert "arbitrary row" in attempt_note({"correct": True, "usable": False, "foreign_literals": []}, 10)
+    assert "arbitrary row" in attempt_note({"correct": True, "usable": False, "foreign_literals": [], "vm_steps": 5}, 10)
     assert "far more expensive" in attempt_note({"correct": True, "usable": True, "vm_steps": None}, 10)

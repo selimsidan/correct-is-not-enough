@@ -362,6 +362,9 @@ def test_dpo_trains_resumes_and_predicts(setup):
     assert [r["step"] for r in log] == list(range(1, 2 * n_q + 1)) and all(r["loss"] > 0 for r in log)
     a = adapter_weights(p.run_dir("D"))
     assert any(not torch.allclose(a[k], adapter_weights(p.run_dir("S"))[k]) for k in a)  # DPO moved the adapter
+    e1 = read_json(p.run_dir("D_e1") / "adapter_meta.json")                # the model after epoch 1 of 2
+    assert e1["complete"] and e1["epochs"] == 1 and e1["n_steps"] == n_q and e1["snapshot_of"] == "D"
+    assert (p.run_dir("D_e1") / "adapter" / "adapter_model.safetensors").exists()
 
     part = train_dpo("exp", "D2", "S", paths=p, cfg=cfg, gen_cfg=gen_cfg, device="cpu", max_steps=1)
     assert not part["complete"]
