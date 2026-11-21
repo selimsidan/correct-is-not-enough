@@ -64,6 +64,9 @@ Paths are set in [configs/paths.yaml](configs/paths.yaml) and two env vars:
 | `75_choose_and_report` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/75_choose_and_report.ipynb) |
 | `76_ablations` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/76_ablations.ipynb) |
 | `77_ablations_report` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/77_ablations_report.ipynb) |
+| `80_judge_train` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/80_judge_train.ipynb) |
+| `81_judge_candidates` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/81_judge_candidates.ipynb) |
+| `82_judge_report` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/82_judge_report.ipynb) |
 | `40_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/40_evaluate.ipynb) |
 | `50_analysis` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/50_analysis.ipynb) |
 
@@ -231,6 +234,29 @@ The method, in order:
 
 Ablations (DPO only): chosen = gold (no generated queries), chosen = the first pool only (no search),
 rejected = other models' pool queries (off-policy, as in the first DPO).
+
+### Generate, then judge (notebooks 80 to 82)
+
+One model, two LoRA adapters on the same frozen Qwen2.5-Coder-7B. The generator (`rl_v1_it8`, unchanged)
+writes up to 17 candidates per question (greedy, 8 samples with its prompt, 8 with the efficient prompt).
+The judge (`configs/judge.yaml`, `src/effsql/judge/`) reads one candidate and gives p, the probability that it
+is correct ("yes" against "no" from the language-model head, as in GradeSQL), and c, its cost relative to the
+question's other correct answers (a linear head on the same hidden state). Answer: among the candidates with
+p >= max p - delta, the lowest c. Nothing is executed at answer time; delta is chosen on validation.
+
+```bash
+python -m effsql.judge data --run judge_data_v1                    # CPU: own_v1 + pool_v1, already executed
+python -m effsql.judge train --run judge_v1 --data judge_data_v1   # A100, resumable
+python -m effsql.judge candidates --run judge_cand_v1              # A100 (vLLM): val, dev, mini-dev
+python -m effsql.judge score --run judge_cand_v1 --judge judge_v1  # A100: p and c per candidate
+python -m effsql.judge label --run judge_cand_v1                   # CPU: execution, for delta and analysis only
+python -m effsql.judge select --run judge_cand_v1 --judge judge_v1 --out judge_v1_sel   # CPU
+```
+
+The judge starts as a copy of the generator's adapter and trains one pass on 55,904 candidates of 8,141 train
+questions (the generator's own answers first, then the first pool; up to 8 per question), validated on the
+held-out databases. Questions of one database share the schema in one sequence and a question's candidates
+share its text (attention mask and position ids keep every candidate's result equal to scoring it alone).
 
 ### Compute and cost
 

@@ -1,0 +1,56 @@
+# Cost-aware judge (planned 2026-11-22). One frozen Qwen2.5-Coder-7B with two LoRA adapters: the generator
+# (rl_v1_it8, unchanged) writes candidates; the judge reads one candidate and gives p (probability that it
+# is correct: "yes" against "no" from the language-model head) and c (its cost relative to the question's
+# other correct answers: a linear head on the same hidden state). Answer: among the candidates with
+# p >= max p - delta, the lowest c. No query is executed at answer time.
+
+data:
+  # Candidates with known labels, all on train questions: the generator's own answers (8 samples per
+  # question, executed in notebook 71) and the base model's pool (notebook 10). The validation part is the
+  # SFT export's held-out databases, so the judge is validated on databases it never saw.
+  own_run: own_v1
+  pool_run: pool_v1
+  export_run: sft_v1
+  # Per question: the distinct own answers first, then pool candidates, up to this many (seeded draw).
+  max_candidates: 8
+  # Cost label of a correct candidate: log2(steps + smooth) minus the mean of that over the question's
+  # correct candidates (own and pool). None when fewer than two correct candidates have a step count.
+  smooth_steps: 100
+  seed: 0
+
+train:
+  init_from: rl_v1_it8  # the judge's adapter starts as a copy of the generator's
+  lr: 1.0e-4            # adapter (as SFT)
+  head_lr: 1.0e-3       # cost head (starts at zero)
+  cost_weight: 0.5      # loss = yes/no cross entropy + cost_weight x squared error of c (correct candidates)
+  questions_per_step: 16
+  # Questions of one database share the system prompt and schema in one sequence; each question's text is
+  # shared by its candidates. Every candidate's result equals the one computed alone (attention mask and
+  # position ids as in SFT).
+  questions_per_seq: 8
+  # Longest packed sequence (tokens): SFT's longest was about 11k on a 40 GB A100 (23 GB peak).
+  max_seq_tokens: 12000
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  save_every: 50
+  eval_every: 200
+  keep_checkpoints: 2
+  seed: 0
+
+candidates:
+  generator: rl_v1_it8
+  # Greedy answer (reused from the generator's predictions) plus samples at temperature 1 with each prompt.
+  samples: {base: 8, efficient: 8}
+  temperature: 1.0
+  max_tokens: 512
+  seed: 0
+  # Labelling (for choosing delta on validation and for the analysis only; never at answer time).
+  step_cap_factor: 20
+  count_timeout_s: 60
+
+score:
+  questions_per_seq: 4
+
+select:
+  deltas: [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0]
+  alpha: 0.05  # a delta is allowed when its validation EX is not significantly below the best (McNemar)
