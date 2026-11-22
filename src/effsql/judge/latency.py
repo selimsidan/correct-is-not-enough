@@ -69,6 +69,13 @@ def format_latency(s: dict[str, Any]) -> str:
 
 def measure_latency(judge_run: str, out: str, split: str = "dev", *, paths: Paths | None = None,
                     jcfg: dict[str, Any] | None = None, n: int | None = None) -> dict[str, Any]:
+    import shutil
+    import subprocess
+
+    if not shutil.which("nvidia-smi") or subprocess.run(["nvidia-smi"], check=False,
+                                                        capture_output=True).returncode != 0:
+        raise RuntimeError("this runtime has no GPU: Runtime > Change runtime type > A100, then run the notebook "
+                           "again (finished questions are kept)")
     from vllm import LLM, SamplingParams  # GPU-only import
     from vllm.lora.request import LoRARequest
 
