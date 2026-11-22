@@ -67,6 +67,8 @@ Paths are set in [configs/paths.yaml](configs/paths.yaml) and two env vars:
 | `80_judge_train` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/80_judge_train.ipynb) |
 | `81_judge_candidates` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/81_judge_candidates.ipynb) |
 | `82_judge_report` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/82_judge_report.ipynb) |
+| `83_vote` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/83_vote.ipynb) |
+| `84_latency` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/84_latency.ipynb) |
 | `40_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/40_evaluate.ipynb) |
 | `50_analysis` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/50_analysis.ipynb) |
 
@@ -257,6 +259,24 @@ The judge starts as a copy of the generator's adapter and trains one pass on 55,
 questions (the generator's own answers first, then the first pool; up to 8 per question), validated on the
 held-out databases. Questions of one database share the schema in one sequence and a question's candidates
 share its text (attention mask and position ids keep every candidate's result equal to scoring it alone).
+
+### Choosing with execution at answer time (notebooks 83, 84)
+
+The candidates hold a correct answer far more often than the judge's pick, so the answer may also use the
+database: every distinct candidate is compiled against the schema (EXPLAIN, no data read) and run once with a
+1 s cap, all in parallel. Methods (`src/effsql/judge/vote.py`): the judge alone, the judge among candidates
+that compile, result voting (candidates grouped by result, the group written most often wins, the judge picks
+within it) and judge-weighted result voting, each also with candidates that return no rows left out of the
+vote when some candidate returned rows. The method with the highest validation EX is kept.
+
+```bash
+python -m effsql.judge exec --run judge_cand_v1                                   # CPU, resumable
+python -m effsql.judge vote --run judge_cand_v1 --judge judge_v1 --out vote_v1    # CPU
+python -m effsql.judge latency --judge judge_v1 --out latency_v1                  # A100: one engine, both adapters
+```
+
+`latency` answers 100 dev questions one at a time with the base model loaded once and both adapters (vLLM),
+and reports the time per stage (generate, judge, waiting for the queries, choosing).
 
 ### Compute and cost
 

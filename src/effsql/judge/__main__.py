@@ -6,6 +6,9 @@
   score       the judge's p and c for every candidate (GPU, resumable)
   label       execute the candidates (CPU, resumable): for choosing delta on validation and the analysis
   select      choose delta on validation, write the selected answers and the selection report (CPU)
+  exec        compile and run every candidate once with the answer-time cap (CPU, resumable)
+  vote        answers by the judge, the compile check and result voting; method kept on validation (CPU)
+  latency     the whole answer path timed question by question (A100, one engine with both adapters)
 """
 
 from __future__ import annotations
@@ -76,6 +79,25 @@ def cmd_select(a: argparse.Namespace) -> None:
     print(format_selection(select(a.run, a.judge, a.out, splits=tuple(_splits(a.splits)))))
 
 
+def cmd_exec(a: argparse.Namespace) -> None:
+    from effsql.judge.vote import exec_candidates
+
+    for split in _splits(a.splits):
+        print(json.dumps(exec_candidates(a.run, split, workers=a.workers), indent=2))
+
+
+def cmd_vote(a: argparse.Namespace) -> None:
+    from effsql.judge.vote import format_vote, vote
+
+    print(format_vote(vote(a.run, a.judge, a.out, splits=tuple(_splits(a.splits)))))
+
+
+def cmd_latency(a: argparse.Namespace) -> None:
+    from effsql.judge.latency import format_latency, measure_latency
+
+    print(format_latency(measure_latency(a.judge, a.out, a.split, n=a.n)))
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="python -m effsql.judge", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -108,6 +130,23 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--out", required=True, help="run name of the selected answers (also <out>_p, <out>_vote)")
     p.add_argument("--splits", default="val,dev,minidev")
     p.set_defaults(func=cmd_select)
+    p = sub.add_parser("exec")
+    p.add_argument("--run", required=True, help="candidates run")
+    p.add_argument("--splits", default="val,dev,minidev")
+    p.add_argument("--workers", type=int)
+    p.set_defaults(func=cmd_exec)
+    p = sub.add_parser("vote")
+    p.add_argument("--run", required=True, help="candidates run (with scores, labels and exec results)")
+    p.add_argument("--judge", required=True)
+    p.add_argument("--out", required=True, help="run name of the kept method's answers (also <out>_<method>)")
+    p.add_argument("--splits", default="val,dev,minidev")
+    p.set_defaults(func=cmd_vote)
+    p = sub.add_parser("latency")
+    p.add_argument("--judge", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--split", default="dev")
+    p.add_argument("--n", type=int, help="questions (default: judge.yaml latency.questions)")
+    p.set_defaults(func=cmd_latency)
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S")
     args.func(args)

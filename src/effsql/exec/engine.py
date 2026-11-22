@@ -138,6 +138,30 @@ def execute(
         conn.set_progress_handler(None, 0)
 
 
+def compiles(conn: sqlite3.Connection, sql: str | None) -> bool:
+    """True when SQLite can compile the statement for this schema (EXPLAIN lists the program without
+    running it, so no table data is read)."""
+    if sql is None or not sql.strip():
+        return False
+    try:
+        conn.execute("EXPLAIN " + sql).fetchall()
+        return True
+    except Exception:  # noqa: BLE001 (any failure means it does not compile)
+        return False
+
+
+def preview_rows(rows: list[tuple], k: int, max_chars: int = 60) -> list[list[Any]]:
+    """The first k rows in JSON form, long text cut to max_chars."""
+    def cell(v: Any) -> Any:
+        if isinstance(v, bytes):
+            v = v.hex()
+        if isinstance(v, str) and len(v) > max_chars:
+            return v[:max_chars] + "..."
+        return v
+
+    return [[cell(v) for v in row] for row in rows[:k]]
+
+
 # Parallel execution (correctness and step counting only; never timing) -------------------------
 
 _worker_conns: dict[str, sqlite3.Connection] = {}
@@ -155,9 +179,17 @@ def _run_job(job: dict[str, Any]) -> dict[str, Any]:
     conn = _worker_conns.get(db_path)
     if conn is None:
         conn = _worker_conns[db_path] = connect_readonly(Path(db_path), _worker_paths)
+    out: dict[str, Any] = {"key": job["key"]}
+    if job.get("compile"):
+        out["compiles"] = compiles(conn, job["sql"])
     # Per-job overrides (e.g. a step budget relative to this question's gold cost).
-    res = execute(conn, job["sql"], **{**_worker_kwargs, **job.get("exec", {})})
-    out = {"key": job["key"], **res.record()}
+    kw = {**_worker_kwargs, **job.get("exec", {})}
+    if job.get("preview"):
+        kw["keep_rows"] = True
+    res = execute(conn, job["sql"], **kw)
+    out.update(res.record())
+    if job.get("preview") and res.ok:
+        out["preview"] = preview_rows(res.rows or [], int(job["preview"]))
     if job.get("features") and res.ok:
         from effsql.measure.cost import plan_features, text_features
 

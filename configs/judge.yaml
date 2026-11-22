@@ -54,3 +54,20 @@ score:
 select:
   deltas: [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0]
   alpha: 0.05  # a delta is allowed when its validation EX is not significantly below the best (McNemar)
+
+# Accuracy with execution at answer time (notebooks 83, 84). Every distinct candidate is compiled against
+# the schema and run once on the database, all in parallel, with a short cap so an answer never waits
+# long; a query still running at the cap gives no result (no vote).
+vote:
+  timeout_s: 1.0
+  max_rows: 100000     # a larger result counts as no result
+  preview_rows: 5      # first rows kept per candidate (for the analysis and a later judge that reads results)
+  # Methods compared on validation; the one with the highest validation EX is kept (ties: earlier in this
+  # list, i.e. the simpler one). Labels are used only for this choice and for the report.
+  # *_nonempty: candidates with an empty result do not vote when some candidate returned rows.
+  methods: [judge, judge_compile, result_vote, weighted_vote, result_vote_nonempty, weighted_vote_nonempty]
+
+latency:
+  questions: 100       # dev questions answered one at a time
+  warmup: 3            # first questions not counted (compilation, caches)
+  gpu_memory_utilization: 0.85
