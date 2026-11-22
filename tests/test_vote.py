@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import sqlite3
@@ -125,3 +126,74 @@ def test_latency_helpers():
             for i in range(10)]
     s = summarize(rows, warmup=2)
     assert s["n_questions"] == 8 and s["total"]["median"] == pytest.approx(5.5) and s["pct_over_3s"] == pytest.approx(75.0)
+
+
+def test_result_text_and_prompts(judge_setup):  # noqa: F811
+    from effsql.data.bird import load_examples
+    from effsql.gen.prompts import load_templates
+    from effsql.judge.model import judge_messages, result_text
+
+    assert result_text({"compiles": False, "ok": False, "error_type": "syntax"}, 1.0).startswith("error: the query does not")
+    assert result_text({"compiles": True, "ok": False, "error_type": "timeout"}, 1.0) == "no result: still running after 1 s"
+    assert result_text({"compiles": True, "ok": True, "n_rows": 0, "preview": []}, 1.0) == "0 rows (empty result)"
+    assert result_text({"compiles": True, "ok": True, "n_rows": 1, "preview": [[10]]}, 1.0) == "1 row:\n10"
+    assert result_text({"ok": True, "n_rows": 7, "preview": [["a", None], ["b", 2.5]]}, 1.0) == \
+        "7 rows, first 2:\na | NULL\nb | 2.5"
+    assert result_text(None, 1.0) == "not run"
+    p, _ = judge_setup
+    e = load_examples("dev", p)[0]
+    t = load_templates()
+    with_res = judge_messages(t, e, "SCHEMA", "SELECT 1", "1 row:\n1")
+    assert "Result when run: 1 row:\n1" in with_res[1]["content"] and "what the query returned" in with_res[0]["content"]
+    assert "Result when run" not in judge_messages(t, e, "SCHEMA", "SELECT 1")[1]["content"]
+
+
+def test_exec_judge_data(judge_setup):  # noqa: F811
+    from effsql.judge.data import read_part
+    from effsql.judge.vote import exec_judge_data
+
+    p, jcfg = judge_setup
+    exec_judge_data("jd", paths=p, jcfg=jcfg, workers=1)
+    exec_judge_data("jd", paths=p, jcfg=jcfg, workers=1)  # resumed: nothing left
+    for part in ("train", "val"):
+        ex = read_exec(p, "jd", part)
+        recs = read_part(p.run_dir("jd"), part)
+        assert set(ex) == {r["qid"] for r in recs}
+        assert all(len(ex[r["qid"]]["results"]) == len(r["cands"]) for r in recs)
+    assert read_exec(p, "jd", "val")["train_1"]["results"][0]["preview"] == [[5]]
+
+
+@pytest.mark.torch
+@pytest.mark.skipif(not all(importlib.util.find_spec(m) for m in ("torch", "transformers", "peft")),
+                    reason="training libraries not installed")
+def test_judge_with_results_trains_and_scores(judge_setup, tmp_path):  # noqa: F811
+    from fakes import FakeBackend
+    from test_sft import make_tiny_model
+
+    from effsql.judge.candidates import generate_candidates
+    from effsql.judge.score import read_scores, score_split
+    from effsql.judge.train import load_judge, train_judge
+    from effsql.judge.vote import exec_judge_data
+
+    p, jcfg = judge_setup
+    cfg = load_config("train.yaml")
+    cfg["sft"].update(base_revision=None, lora={**cfg["sft"]["lora"], "r": 4, "alpha": 8})
+    gen_cfg = load_config("generate.yaml")
+    gen_cfg["model"] = {"id": str(make_tiny_model(tmp_path / "tiny")), "revision": None}
+    kw = {"paths": p, "jcfg": jcfg, "cfg": cfg, "gen_cfg": gen_cfg, "device": "cpu"}
+    with pytest.raises(FileNotFoundError):
+        train_judge("JR", "jd", with_results=True, **kw)  # results not run yet
+    exec_judge_data("jd", paths=p, jcfg=jcfg, workers=1)
+    meta = train_judge("JR", "jd", with_results=True, **kw)
+    assert meta["complete"] and meta["with_results"] and meta["timeout_s"] == jcfg["vote"]["timeout_s"]
+
+    generate_candidates("cand", "dev", FakeBackend(), paths=p, jcfg=jcfg)
+    model, head, tok, yes_no, jmeta = load_judge(p, "JR", "cpu", cfg=cfg, gen_cfg=gen_cfg)
+    with pytest.raises(FileNotFoundError):
+        score_split("JR", "cand", "dev", (model, head, tok, yes_no), paths=p, jcfg=jcfg, cfg=cfg, device="cpu",
+                    with_results=True)
+    exec_candidates("cand", "dev", paths=p, jcfg=jcfg, workers=1)
+    score_split("JR", "cand", "dev", (model, head, tok, yes_no), paths=p, jcfg=jcfg, cfg=cfg, device="cpu",
+                with_results=jmeta["with_results"])
+    s = read_scores(p, "cand", "JR", "dev")
+    assert set(s) == {"dev_0", "dev_1", "dev_2"} and all(0 <= x <= 1 for r in s.values() for x in r["p"])

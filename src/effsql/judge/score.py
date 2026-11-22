@@ -2,7 +2,8 @@
 
 Reads runs/<cand_run>/candidates_<split>.jsonl, writes runs/<cand_run>/scores_<judge>_<split>.jsonl:
 {qid, p: [...], c: [...]} in the order of the candidates (p = sigmoid of the yes-minus-no logit).
-Nothing is executed.
+Nothing is executed here; a judge trained with results reads them from runs/<cand_run>/exec_<split>.jsonl
+(`python -m effsql.judge exec`).
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ def scores_path(paths: Paths, cand_run: str, judge_run: str, split: str):
 
 def score_split(judge_run: str, cand_run: str, split: str, judge: tuple[Any, Any, Any, tuple[int, int]], *,
                 paths: Paths | None = None, jcfg: dict[str, Any] | None = None, cfg: dict[str, Any] | None = None,
-                device: str = "cuda") -> dict[str, Any]:
+                device: str = "cuda", with_results: bool = False) -> dict[str, Any]:
     import torch
 
     paths = paths or load_paths()
@@ -37,7 +38,13 @@ def score_split(judge_run: str, cand_run: str, split: str, judge: tuple[Any, Any
     out = scores_path(paths, cand_run, judge_run, split)
     done = done_ids(out)
     recs = [r for r in read_candidates(paths, cand_run, split) if r["qid"] not in done]
-    questions, stats = build_questions(tok, recs, data_split(split), paths, cfg["prompt"]["max_prompt_tokens"])
+    results = None
+    if with_results:
+        from effsql.judge.vote import read_exec
+
+        results = read_exec(paths, cand_run, split)
+    questions, stats = build_questions(tok, recs, data_split(split), paths, cfg["prompt"]["max_prompt_tokens"],
+                                       results, jcfg["vote"]["timeout_s"])
     groups = make_groups(questions, list(range(len(questions))), jcfg["score"]["questions_per_seq"],
                          int(jcfg["train"].get("max_seq_tokens", 16000)), np.random.default_rng(0))
     log.info("score %s: %d questions in %d sequences (%d done before)", split, len(questions), len(groups), len(done))

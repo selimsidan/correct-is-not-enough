@@ -7,6 +7,10 @@ h gives:
   correctness  logit of "yes" minus logit of "no" from the language-model head (p = sigmoid of it);
   cost         c = w . h + b, a linear head (hidden_size + 1 numbers) trained on relative log cost.
 
+A judge trained with results (judge_meta with_results, `train --with-results`) reads, after the candidate
+query, what it returned when run with the answer-time cap (`result_text`: the number of rows and the first
+rows, or the error); the prompt is judge_*_results.txt.
+
 Packing: questions of one database share the system prompt and schema, and the candidates of a question
 share everything up to the candidate SQL. One sequence holds [shared prefix][question 1 text][candidate
 1][candidate 2]...[question 2 text]...; a candidate attends to the shared prefix, its question's text and
@@ -38,23 +42,54 @@ class JQuestion:
 
 
 # Prompts ----------------------------------------------------------------------------------------
-def judge_messages(templates: dict[str, str], example: Any, schema_text: str, sql: str) -> list[dict[str, str]]:
-    user = fill(templates["judge_user"], {"db_id": example.db_id, "schema": schema_text, "question": example.question,
-                                          "evidence": example.evidence or "(none)", "sql": sql.strip()})
-    return [{"role": "system", "content": templates["judge_system"]}, {"role": "user", "content": user}]
+def result_text(r: dict[str, Any] | None, timeout_s: float, max_line: int = 200) -> str:
+    """What a candidate returned, from its execution record (judge/vote.py EXEC_FIELDS): the number of rows
+    and the first rows (one line each, cells joined by " | "), or why there is no result."""
+    if not r:
+        return "not run"
+    if r.get("compiles") is False:
+        return "error: the query does not compile for this schema"
+    if not r.get("ok"):
+        if r.get("error_type") == "timeout":
+            return f"no result: still running after {timeout_s:g} s"
+        if r.get("error_type") == "too_many_rows":
+            return "no result: too many rows"
+        return f"error while running ({r.get('error_type') or 'unknown'})"
+    n = int(r.get("n_rows") or 0)
+    if n == 0:
+        return "0 rows (empty result)"
+    rows = r.get("preview") or []
+    lines = [" | ".join("NULL" if v is None else str(v) for v in row) for row in rows]
+    lines = [x if len(x) <= max_line else x[:max_line] + "..." for x in lines]
+    head = f"{n} row{'s' if n != 1 else ''}" + (f", first {len(rows)}" if len(rows) < n else "")
+    return head + ":\n" + "\n".join(lines)
+
+
+def judge_messages(templates: dict[str, str], example: Any, schema_text: str, sql: str,
+                   result: str | None = None) -> list[dict[str, str]]:
+    suffix = "" if result is None else "_results"
+    user = fill(templates["judge_user" + suffix], {
+        "db_id": example.db_id, "schema": schema_text, "question": example.question,
+        "evidence": example.evidence or "(none)", "sql": sql.strip(), "result": result or ""})
+    return [{"role": "system", "content": templates["judge_system" + suffix]}, {"role": "user", "content": user}]
 
 
 def question_prompts(tok: Any, templates: dict[str, str], example: Any, schema: dict[str, Any], sqls: list[str],
-                     budget: int) -> tuple[list[list[int]], str, int]:
+                     budget: int, results: list[str] | None = None) -> tuple[list[list[int]], str, int]:
     """Token ids of every candidate's prompt with one schema level for the whole question (the level at
-    which the longest candidate fits). Returns (ids per candidate, level, longest prompt length)."""
+    which the longest candidate fits). With results, each candidate's prompt also shows its result text.
+    Returns (ids per candidate, level, longest prompt length)."""
     from effsql.train.sft import make_counter, prompt_text
 
-    longest = max(sqls, key=len) if sqls else ""
-    _, level, n = fit_messages(lambda s: judge_messages(templates, example, s, longest), schema, budget,
+    if results is not None and len(results) != len(sqls):
+        raise ValueError(f"{len(results)} results for {len(sqls)} candidates")
+    res = results if results is not None else [None] * len(sqls)
+    j = max(range(len(sqls)), key=lambda i: len(sqls[i]) + len(res[i] or "")) if sqls else None
+    longest, longest_res = (sqls[j], res[j]) if j is not None else ("", None if results is None else "")
+    _, level, n = fit_messages(lambda s: judge_messages(templates, example, s, longest, longest_res), schema, budget,
                                make_counter(tok))
     schema_text = render_schema(schema, next(x for x in SHRINK_LADDER if x["name"] == level))
-    texts = [prompt_text(tok, judge_messages(templates, example, schema_text, s)) for s in sqls]
+    texts = [prompt_text(tok, judge_messages(templates, example, schema_text, s, x)) for s, x in zip(sqls, res)]
     if not texts:
         return [], level, n
     # The text before the SQL is the same for every candidate: tokenized once, checked once against the
@@ -252,9 +287,11 @@ def sigmoid(x: float) -> float:
     return 1 / (1 + math.exp(-x)) if x >= 0 else math.exp(x) / (1 + math.exp(x))
 
 
-def build_questions(tok: Any, recs: list[dict[str, Any]], split: str, paths: Any, budget: int
+def build_questions(tok: Any, recs: list[dict[str, Any]], split: str, paths: Any, budget: int,
+                    results: dict[str, dict[str, Any]] | None = None, timeout_s: float = 1.0
                     ) -> tuple[list[JQuestion], dict[str, Any]]:
-    """JQuestions from records {qid, cands: [{sql, label?, cost?}]} of one data split (train, dev, minidev)."""
+    """JQuestions from records {qid, cands: [{sql, label?, cost?}]} of one data split (train, dev, minidev).
+    With results (qid -> {results: [execution record per candidate]}), the prompts show each result."""
     from effsql.data.bird import load_examples
     from effsql.gen.prompts import load_templates
     from effsql.gen.sample import schemas_for
@@ -266,7 +303,14 @@ def build_questions(tok: Any, recs: list[dict[str, Any]], split: str, paths: Any
     out, too_long, levels = [], 0, {}
     for r in recs:
         e = examples[r["qid"]]
-        ids, level, n = question_prompts(tok, templates, e, schemas[e.db_id], [c["sql"] for c in r["cands"]], budget)
+        texts = None
+        if results is not None:
+            ex = results.get(r["qid"], {}).get("results")
+            if ex is None or len(ex) != len(r["cands"]):
+                raise ValueError(f"{r['qid']}: execution results do not match its candidates (rerun the exec step)")
+            texts = [result_text(x, timeout_s) for x in ex]
+        ids, level, n = question_prompts(tok, templates, e, schemas[e.db_id], [c["sql"] for c in r["cands"]], budget,
+                                         texts)
         if n > budget:
             too_long += 1
             continue

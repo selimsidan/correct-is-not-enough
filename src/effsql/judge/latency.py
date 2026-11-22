@@ -9,6 +9,8 @@ time, as a user would ask:
   3. judge     one prompt per candidate, one generated token with the judge adapter; p = sigmoid of the
                log-probability of "yes" minus that of "no";
   4. choose    every method of vote.methods (vote.py).
+A judge trained with results (judge_meta with_results) reads each candidate's result, so step 3 waits for
+step 2 and run_wait is the time between the end of generation and the start of judging.
 Writes runs/<out>/latency_<split>.jsonl (per question: seconds per stage, total, candidates, the answer
 of each method) and latency_<split>.json (median, p90 and max per stage, warm-up questions left out).
 The answers are for checking only; accuracy comes from the offline runs (notebooks 81 to 83).
@@ -62,8 +64,9 @@ def format_latency(s: dict[str, Any]) -> str:
     for st in STAGES:
         if st in s:
             lines.append(f"  {st:<10}{s[st]['median']:>8.2f}{s[st]['p90']:>8.2f}{s[st]['max']:>8.2f}")
-    lines.append(f"  answers over 3 s: {s['pct_over_3s']:.1f}%   (run_wait: time still waiting for the queries after "
-                 "the judge finished)")
+    wait = ("before the judge (it reads the results)" if s.get("judge_reads_results")
+            else "after the judge finished")
+    lines.append(f"  answers over 3 s: {s['pct_over_3s']:.1f}%   (run_wait: time waiting for the queries {wait})")
     return "\n".join(lines)
 
 
@@ -86,7 +89,7 @@ def measure_latency(judge_run: str, out: str, split: str = "dev", *, paths: Path
     from effsql.gen.prompts import build_question_prompt, load_templates
     from effsql.gen.sample import schemas_for
     from effsql.judge.candidates import add_candidate
-    from effsql.judge.model import answer_token_ids, question_prompts
+    from effsql.judge.model import answer_token_ids, question_prompts, result_text
     from effsql.judge.vote import exec_jobs, method_index
     from effsql.train.data import train_messages
     from effsql.train.sft import base_model_cfg, make_counter
@@ -125,6 +128,7 @@ def measure_latency(judge_run: str, out: str, split: str = "dev", *, paths: Path
         raise RuntimeError(f"yes/no token ids {yes_no} differ from the judge's {jmeta['yes_id'], jmeta['no_id']}")
     count = make_counter(tok)
     greedy_max = gen_cfg["sampling"]["greedy"]["max_tokens"]
+    with_results = bool(jmeta.get("with_results"))
 
     path = paths.run_dir(out) / f"latency_{split}.jsonl"
     done = done_ids(path)
@@ -154,14 +158,20 @@ def measure_latency(judge_run: str, out: str, split: str = "dev", *, paths: Path
             t1 = time.perf_counter()
 
             ran_at: list[float] = []
-            jobs = exec_jobs([{"qid": e.qid, "db_id": e.db_id, "cands": cl}], split, paths, 0)
+            jobs = exec_jobs([{"qid": e.qid, "db_id": e.db_id, "cands": cl}], split, paths,
+                             vc["preview_rows"] if with_results else 0)
             pending = pool.map_async(_run_job, jobs, callback=lambda _, t=ran_at: t.append(time.perf_counter())) \
                 if jobs else None
+            results = None
+            if with_results:
+                results = sorted(pending.get(), key=lambda r: r["key"]) if pending else []
+            t_judge = time.perf_counter()
 
             p: list[float] = []
             n_missing = 0
             if cl:
-                ids, _, _ = question_prompts(tok, templates, e, schema, [c["sql"] for c in cl], budget)
+                texts = [result_text(r, vc["timeout_s"]) for r in results] if with_results else None
+                ids, _, _ = question_prompts(tok, templates, e, schema, [c["sql"] for c in cl], budget, texts)
                 jout = llm.generate([{"prompt_token_ids": x} for x in ids],
                                     SamplingParams(n=1, temperature=0.0, max_tokens=1, logprobs=20),
                                     use_tqdm=False, lora_request=lora_judge)
@@ -171,13 +181,15 @@ def measure_latency(judge_run: str, out: str, split: str = "dev", *, paths: Path
                     p.append(pi)
                     n_missing += miss
             t2 = time.perf_counter()
-            results = sorted(pending.get(), key=lambda r: r["key"]) if pending else []
+            if results is None:
+                results = sorted(pending.get(), key=lambda r: r["key"]) if pending else []
             t3 = time.perf_counter()
             choice = {m: method_index(m, cl, p, results) for m in vc["methods"]}
             t4 = time.perf_counter()
             append_jsonl(path, [{
                 "qid": e.qid, "db_id": e.db_id, "n_candidates": len(cl), "n_judge_missing": n_missing,
-                "seconds": {"generate": t1 - t0, "judge": t2 - t1, "run_wait": t3 - t2, "choose": t4 - t3,
+                "seconds": {"generate": t1 - t0, "judge": t2 - t_judge, "run_wait": (t_judge - t1) + (t3 - t2),
+                            "choose": t4 - t3,
                             "total": t4 - t0, "run_done_after_generate": (ran_at[0] - t1) if ran_at else 0.0},
                 "max_completion_tokens": max((len(c.token_ids) for o in outs for c in o.outputs), default=0),
                 "answers": {m: (cl[i]["sql"] if i is not None else "") for m, i in choice.items()}}])
@@ -186,7 +198,8 @@ def measure_latency(judge_run: str, out: str, split: str = "dev", *, paths: Path
         pool.join()
     rows = list(iter_jsonl(path))
     s = summarize(rows, lc["warmup"])
-    s.update(split=split, judge_run=judge_run, generator=cc["generator"], timeout_s=vc["timeout_s"], workers=workers)
+    s.update(split=split, judge_run=judge_run, generator=cc["generator"], timeout_s=vc["timeout_s"], workers=workers,
+             judge_reads_results=with_results)
     write_json(paths.run_dir(out) / f"latency_{split}.json", s)
     (paths.run_dir(out) / f"latency_{split}.txt").write_text(format_latency(s) + "\n", encoding="utf-8")
     return s

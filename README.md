@@ -69,6 +69,8 @@ Paths are set in [configs/paths.yaml](configs/paths.yaml) and two env vars:
 | `82_judge_report` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/82_judge_report.ipynb) |
 | `83_vote` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/83_vote.ipynb) |
 | `84_latency` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/84_latency.ipynb) |
+| `85_judge_results` | A100 GPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/85_judge_results.ipynb) |
+| `86_judge_results_report` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/86_judge_results_report.ipynb) |
 | `40_evaluate` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/40_evaluate.ipynb) |
 | `50_analysis` | CPU | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/selimsidan/correct-is-not-enough/blob/main/notebooks/50_analysis.ipynb) |
 
@@ -277,6 +279,21 @@ python -m effsql.judge latency --judge judge_v1 --out latency_v1                
 
 `latency` answers 100 dev questions one at a time with the base model loaded once and both adapters (vLLM),
 and reports the time per stage (generate, judge, waiting for the queries, choosing).
+
+### A judge that reads the results (notebooks 85, 86)
+
+`judge_v2` replaces `judge_v1` (it is not trained on top of it): the same data, settings and starting point
+(a copy of the generator's adapter), but each prompt also shows what the candidate returned when run with the
+answer-time cap (the number of rows and the first 5 rows, or the error). The two judges differ only in what
+they read, so the comparison shows whether a learned judge can take the place of hand-written rules such as
+"rows first".
+
+```bash
+python -m effsql.judge exec-data --run judge_data_v1                              # CPU, train databases
+python -m effsql.judge train --run judge_v2 --data judge_data_v1 --with-results   # A100, resumable
+python -m effsql.judge score --run judge_cand_v1 --judge judge_v2                 # reads exec_<split>.jsonl
+python -m effsql.judge vote --run judge_cand_v1 --judge judge_v2 --out vote_v2    # CPU
+```
 
 ### Compute and cost
 

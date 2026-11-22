@@ -1,7 +1,8 @@
 """`python -m effsql.judge <command>`: the cost-aware judge (configs/judge.yaml).
 
   data        the judge's training data from executed own answers and the pool (CPU, minutes)
-  train       train the judge's adapter and cost head (A100, resumable)
+  exec-data   run the training data's candidates with the answer-time cap, for a judge that reads results
+  train       train the judge's adapter and cost head (A100, resumable; --with-results: prompts show results)
   candidates  the generator's candidates for val, dev and mini-dev (GPU, vLLM, resumable)
   score       the judge's p and c for every candidate (GPU, resumable)
   label       execute the candidates (CPU, resumable): for choosing delta on validation and the analysis
@@ -34,7 +35,7 @@ def cmd_data(a: argparse.Namespace) -> None:
 def cmd_train(a: argparse.Namespace) -> None:
     from effsql.judge.train import train_judge
 
-    m = train_judge(a.run, a.data, max_steps=a.max_steps)
+    m = train_judge(a.run, a.data, max_steps=a.max_steps, with_results=a.with_results)
     print(json.dumps({k: m[k] for k in ("n_steps", "complete", "val_final", "train_questions")}, indent=2, default=str))
 
 
@@ -61,9 +62,10 @@ def cmd_score(a: argparse.Namespace) -> None:
 
     paths = load_paths()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, head, tok, yes_no, _ = load_judge(paths, a.judge, device)
+    model, head, tok, yes_no, meta = load_judge(paths, a.judge, device)
     for split in _splits(a.splits):
-        print(json.dumps(score_split(a.judge, a.run, split, (model, head, tok, yes_no), device=device), indent=2))
+        print(json.dumps(score_split(a.judge, a.run, split, (model, head, tok, yes_no), device=device,
+                                     with_results=bool(meta.get("with_results"))), indent=2))
 
 
 def cmd_label(a: argparse.Namespace) -> None:
@@ -84,6 +86,12 @@ def cmd_exec(a: argparse.Namespace) -> None:
 
     for split in _splits(a.splits):
         print(json.dumps(exec_candidates(a.run, split, workers=a.workers), indent=2))
+
+
+def cmd_exec_data(a: argparse.Namespace) -> None:
+    from effsql.judge.vote import exec_judge_data
+
+    print(json.dumps(exec_judge_data(a.run, workers=a.workers), indent=2))
 
 
 def cmd_vote(a: argparse.Namespace) -> None:
@@ -108,6 +116,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--run", required=True)
     p.add_argument("--data", required=True, help="run holding judge_train.jsonl and judge_val.jsonl")
     p.add_argument("--max-steps", type=int, help="stop early (smoke tests only)")
+    p.add_argument("--with-results", action="store_true", help="prompts show each candidate's result (exec-data first)")
     p.set_defaults(func=cmd_train)
     p = sub.add_parser("candidates")
     p.add_argument("--run", required=True, help="output run for the candidates (and later scores and labels)")
@@ -135,6 +144,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--splits", default="val,dev,minidev")
     p.add_argument("--workers", type=int)
     p.set_defaults(func=cmd_exec)
+    p = sub.add_parser("exec-data")
+    p.add_argument("--run", required=True, help="judge data run (judge_train.jsonl, judge_val.jsonl)")
+    p.add_argument("--workers", type=int)
+    p.set_defaults(func=cmd_exec_data)
     p = sub.add_parser("vote")
     p.add_argument("--run", required=True, help="candidates run (with scores, labels and exec results)")
     p.add_argument("--judge", required=True)

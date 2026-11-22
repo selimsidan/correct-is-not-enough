@@ -5,6 +5,10 @@ no table data read) and run once with the answer-time cap (judge.yaml vote.timeo
 would be when answering. runs/<cand_run>/exec_<split>.jsonl: {qid, results: [{compiles, ok, error_type,
 result_hash, n_rows, elapsed_ms, preview}]} in candidate order (resumable by question).
 
+`python -m effsql.judge exec-data`: the same for the judge's training data (runs/<data_run>/judge_train.jsonl
+and judge_val.jsonl, train databases), written to exec_train.jsonl and exec_val.jsonl in that run, so a
+judge can be trained on what candidates return (`train --with-results`).
+
 `python -m effsql.judge vote`: one answer per question by each method, from what is known at answer time
 only (the candidates, how often each was written, the judge's p, the execution results):
   judge          the highest p (the judge alone, as <judge sel>_p)
@@ -44,30 +48,48 @@ METHODS = ("judge", "judge_compile", "result_vote", "weighted_vote", "result_vot
 EXEC_FIELDS = ("compiles", "ok", "error_type", "result_hash", "n_rows", "elapsed_ms", "preview")
 
 
-def exec_jobs(recs: list[dict[str, Any]], split: str, paths: Paths, preview: int) -> list[dict[str, Any]]:
-    """One job per candidate, keys numbered in order (question by question, candidate by candidate)."""
+def exec_jobs(recs: list[dict[str, Any]], db_split: str, paths: Paths, preview: int) -> list[dict[str, Any]]:
+    """One job per candidate, keys numbered in order (question by question, candidate by candidate).
+    db_split: the BIRD split whose databases hold the questions (train, dev, minidev)."""
     jobs = []
     for r in recs:
         for c in r["cands"]:
-            jobs.append({"key": len(jobs), "db_path": paths.local_db_path(data_split(split), r["db_id"]),
+            jobs.append({"key": len(jobs), "db_path": paths.local_db_path(db_split, r["db_id"]),
                          "sql": c["sql"], "compile": True, "preview": preview})
     return jobs
 
 
 def exec_candidates(run: str, split: str, *, paths: Paths | None = None, jcfg: dict[str, Any] | None = None,
                     workers: int | None = None, chunk: int = 200) -> dict[str, Any]:
-    from effsql.exec.engine import batched, execute_many
+    paths = paths or load_paths()
+    cands = read_candidates(paths, run, split)
+    return exec_records(cands, data_split(split), paths.run_dir(run) / f"exec_{split}.jsonl", split,
+                        paths=paths, jcfg=jcfg, workers=workers, chunk=chunk)
+
+
+def exec_judge_data(data_run: str, *, paths: Paths | None = None, jcfg: dict[str, Any] | None = None,
+                    workers: int | None = None, chunk: int = 200) -> list[dict[str, Any]]:
+    from effsql.judge.data import read_part
 
     paths = paths or load_paths()
+    run_dir = paths.run_dir(data_run, create=False)
+    return [exec_records(read_part(run_dir, part), "train", run_dir / f"exec_{part}.jsonl", part, paths=paths,
+                         jcfg=jcfg, workers=workers, chunk=chunk) for part in ("train", "val")]
+
+
+def exec_records(cands: list[dict[str, Any]], db_split: str, out: Any, name: str, *, paths: Paths,
+                 jcfg: dict[str, Any] | None = None, workers: int | None = None, chunk: int = 200) -> dict[str, Any]:
+    """Compile and run the candidates of records {qid, db_id, cands} with the answer-time cap; appends
+    {qid, results} to out (resumable by question)."""
+    from effsql.exec.engine import batched, execute_many
+
     jcfg = jcfg or load_config("judge.yaml")
     vc = jcfg["vote"]
-    cands = read_candidates(paths, run, split)
-    out = paths.run_dir(run) / f"exec_{split}.jsonl"
     done = done_ids(out)
     todo = [r for r in cands if r["qid"] not in done]
-    log.info("exec %s: %d questions to run (%d done)", split, len(todo), len(done))
+    log.info("exec %s: %d questions to run (%d done)", name, len(todo), len(done))
     for part in batched(todo, chunk):
-        jobs = exec_jobs(part, split, paths, vc["preview_rows"])
+        jobs = exec_jobs(part, db_split, paths, vc["preview_rows"])
         res = {x["key"]: x for x in execute_many(jobs, paths, workers=workers, timeout_s=vc["timeout_s"],
                                                  max_rows=vc["max_rows"], count_steps=False)} if jobs else {}
         recs, k = [], 0
@@ -78,8 +100,8 @@ def exec_candidates(run: str, split: str, *, paths: Paths | None = None, jcfg: d
                 k += 1
             recs.append({"qid": r["qid"], "results": rows})
         append_jsonl(out, recs)
-        log.info("exec %s: %d more questions", split, len(recs))
-    return {"split": split, "n_questions": len(cands), "n_run_now": len(todo)}
+        log.info("exec %s: %d more questions", name, len(recs))
+    return {"split": name, "n_questions": len(cands), "n_run_now": len(todo)}
 
 
 def read_exec(paths: Paths, run: str, split: str) -> dict[str, dict[str, Any]]:

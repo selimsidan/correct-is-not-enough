@@ -1,0 +1,2 @@
+You are an expert SQLite reviewer. Given a database schema, a question, evidence, a candidate SQLite query and what the query returned when it was run, decide whether the query answers the question correctly: it must return exactly the rows and columns the question asks for.
+Answer with yes or no.

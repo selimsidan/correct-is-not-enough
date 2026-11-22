@@ -9,6 +9,10 @@ Resume: a checkpoint (adapter weights, cost head, optimizer, scheduler, RNG, ste
 running the same command again continues from the newest one. At the end: runs/<run>/adapter/ (the
 adapter, as vLLM and peft read it), cost_head.pt and judge_meta.json (complete: true). Validation metrics
 on the held-out databases go to val_log.jsonl every eval_every steps and at the end.
+
+With results (`--with-results`): every prompt also shows what the candidate returned when run with the
+answer-time cap (exec_train.jsonl / exec_val.jsonl of the data run, from `exec-data`). Everything else is as
+without, so the two judges differ only in what they read.
 """
 
 from __future__ import annotations
@@ -121,7 +125,7 @@ def load_judge(paths: Paths, run: str, device: str, cfg: dict[str, Any] | None =
 
 def train_judge(run: str, data_run: str, *, paths: Paths | None = None, jcfg: dict[str, Any] | None = None,
                 cfg: dict[str, Any] | None = None, gen_cfg: dict[str, Any] | None = None,
-                max_steps: int | None = None, device: str | None = None) -> dict[str, Any]:
+                max_steps: int | None = None, device: str | None = None, with_results: bool = False) -> dict[str, Any]:
     import torch
 
     from effsql.train.sft import (
@@ -149,8 +153,15 @@ def train_judge(run: str, data_run: str, *, paths: Paths | None = None, jcfg: di
     yes_no = answer_token_ids(tok)
     budget = cfg["prompt"]["max_prompt_tokens"]
     max_tokens = int(tc.get("max_seq_tokens", 16000))
-    train_q, tstats = build_questions(tok, read_part(data_dir, "train"), "train", paths, budget)
-    val_q, vstats = build_questions(tok, read_part(data_dir, "val"), "train", paths, budget)
+    timeout_s = jcfg["vote"]["timeout_s"]
+    if with_results:
+        from effsql.judge.vote import read_exec
+
+        res = {part: read_exec(paths, data_run, part) for part in ("train", "val")}
+    else:
+        res = {"train": None, "val": None}
+    train_q, tstats = build_questions(tok, read_part(data_dir, "train"), "train", paths, budget, res["train"], timeout_s)
+    val_q, vstats = build_questions(tok, read_part(data_dir, "val"), "train", paths, budget, res["val"], timeout_s)
     steps = plan_steps(train_q, tc["questions_per_seq"], tc["questions_per_step"], max_tokens, tc["seed"])
     import numpy as np
 
@@ -170,7 +181,7 @@ def train_judge(run: str, data_run: str, *, paths: Paths | None = None, jcfg: di
                             weight_decay=0.0, fused=device == "cuda")
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda(full_steps, max(1, math.ceil(tc["warmup_ratio"] * full_steps))))
     fp = {"data_run": data_run, "data_stats": dmeta["stats"], "init_from": tc["init_from"], "n_steps": full_steps,
-          "train": tc, "judge_version": JUDGE_VERSION}
+          "train": tc, "judge_version": JUDGE_VERSION, "with_results": with_results}
     ckpt_dir = run_dir / "checkpoints"
     start = load_state(ckpt_dir, model, head, opt, sched, fp)
     save_config(jcfg, run_dir / "judge_config.yaml")
@@ -249,7 +260,8 @@ def train_judge(run: str, data_run: str, *, paths: Paths | None = None, jcfg: di
             "base_revision": model_cfg.get("revision"), "yes_id": yes_no[0], "no_id": yes_no[1],
             "hidden_size": head.in_features, "n_steps": n_steps, "gpu": gpu, "train_questions": tstats,
             "val_questions": vstats, "val_final": final, "complete": n_steps == full_steps,
-            "judge_version": JUDGE_VERSION}
+            "judge_version": JUDGE_VERSION, "with_results": with_results,
+            "timeout_s": timeout_s if with_results else None}
     write_json(run_dir / "judge_meta.json", meta)
     log.info("judge written to %s; validation %s", run_dir, final)
     return meta
