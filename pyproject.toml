@@ -27,7 +27,8 @@ gen = ["vllm==0.32.0"]
 # prediction share one environment; torch comes with vLLM (2.13.0).
 train = ["transformers==5.19.0", "peft==0.21.2"]
 # The demo (notebook 90): the page, the adapters from Hugging Face, 4-bit loading on small GPUs.
-demo = ["gradio==5.49.1", "huggingface-hub>=0.34,<2", "bitsandbytes>=0.46.1"]
+# gradio 6: gradio 5 needs pydantic<2.12, pillow<12 and starlette<1, which vLLM 0.32.0 rules out.
+demo = ["gradio==6.31.0", "huggingface-hub>=0.34,<2", "bitsandbytes>=0.46.1"]
 dev = ["pytest>=8.0", "pre-commit>=3.5", "nbstripout>=0.7"]
 
 [project.scripts]
