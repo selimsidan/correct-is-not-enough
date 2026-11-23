@@ -324,6 +324,17 @@ python -m effsql.ablate zero-shot-val --run zero_shot_v1                        
 python -m effsql.ablate report --out ablations_report                              # CPU, nothing executed
 ```
 
+### Demo (notebook 90)
+
+[Open the demo in Colab](https://colab.research.google.com/github/selimsidan/generate-then-judge-sql/blob/main/notebooks/90_demo.ipynb):
+pick a BIRD dev database, type a question (and optionally a hint), and see the SQL the system chose, its result,
+and every query it wrote with what it returned and the verifier's score. *Run all* on a free T4 GPU (the base model
+in 4 bit) or an L4 or A100 (16 bit, exactly the reported system). BIRD dev is downloaded from BIRD's site and
+checked against the files every experiment used; the two adapters come from the Hugging Face repository.
+
+`effsql.answer.System` is the whole answer path for one question (generate, run with the 1 s cap, judge, choose).
+The demo (`effsql.app`) and the latency measurement (`python -m effsql.judge latency`) both answer through it.
+
 ### Compute and cost
 
 * GPU (L4) only for `generate`, `rewrite` and `predict`; everything else is CPU work. Part A runs its CPU steps on

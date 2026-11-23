@@ -31,6 +31,9 @@ def test_no_en_or_em_dashes_in_repo():
     assert not offenders, offenders
 
 
+STANDALONE = {"90_demo.ipynb"}  # the public demo: its own setup, without Drive
+
+
 def test_notebooks_share_setup_cell_and_have_no_outputs():
     import json
 
@@ -40,6 +43,8 @@ def test_notebooks_share_setup_cell_and_have_no_outputs():
     for nb_path in notebooks:
         nb = json.loads(nb_path.read_text(encoding="utf-8"))
         code_cells = [c for c in nb["cells"] if c["cell_type"] == "code"]
+        assert all(not c.get("outputs") for c in code_cells), f"{nb_path.name} has outputs"
+        if nb_path.name in STANDALONE:
+            continue
         first = "".join(code_cells[0]["source"]).strip().replace("GPU = True", "GPU = False")
         assert first == setup, f"{nb_path.name}: setup cell differs from notebooks/setup_cell.py"
-        assert all(not c.get("outputs") for c in code_cells), f"{nb_path.name} has outputs"

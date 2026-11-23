@@ -1,0 +1,35 @@
+# The demo (notebook 90, effsql.app): the final system answers your own questions on the BIRD dev databases.
+adapters:
+  # Public Hugging Face model repository with the two LoRA adapters, one folder each.
+  repo: selimsidan/generate-then-judge-sql
+  revision: null          # pinned to the published commit after the upload
+  generator: generator
+  judge: verifier
+  # Before anything is published: the same adapters read from Drive (runs/<name>/adapter).
+  drive_generator: rl_v1_it8
+  drive_judge: judge_v2
+
+# How the generator was trained (runs/rl_v1_it8/adapter_meta.json) and how the system chooses (vote_v2,
+# kept on validation). The judge reads each candidate's result.
+generator_prompt: {arm: best, tag: null}
+judge_reads_results: true
+method: weighted_vote
+
+# BIRD dev, downloaded from BIRD's own site. The archive is checked against these hashes, which equal the
+# files every experiment used (dev.json, dev.sql, dev_tables.json, dev_databases.zip, dev_tied_append.json).
+bird:
+  url: https://bird-bench.oss-cn-beijing.aliyuncs.com/dev.zip
+  sha256: cdd6d19faeb45a23970b98d3ef6c40a87987c95459c2cf12076897a60cf5a630
+  folder: dev_20240627
+  files_sha256:
+    dev.json: 630272f2b1c44d8cef2c3b246f623355cf0bbc1e832c81061df895530dfc2f06
+    dev_databases.zip: 8132aacfe61ecec7198a62e93cb8512dac89b1d6b9922fe3c7bb94b13f317d8f
+
+runtime:
+  root: /content/gtj_demo
+  full_min_gpu_gb: 22       # 16-bit weights need an L4 (24 GB) or an A100; smaller GPUs (T4) get 4 bit
+  gpu_memory_utilization: 0.85
+  quantized_max_model_len: 12288
+  display_rows: 20          # rows of the answer shown
+  display_timeout_s: 30     # cap when the answer and the reference query are run again for showing
+  examples_per_db: 6
