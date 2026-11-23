@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 
 from effsql.config import load_config
-from effsql.io import append_jsonl, done_ids, latest_by
+from effsql.io import append_jsonl, done_ids, latest_by, write_json
 from effsql.judge.candidates import data_split, read_candidates
 from effsql.judge.model import build_questions, forward, make_groups, sigmoid
 from effsql.paths import Paths, load_paths
@@ -24,6 +24,10 @@ log = logging.getLogger(__name__)
 
 def scores_path(paths: Paths, cand_run: str, judge_run: str, split: str):
     return paths.run_dir(cand_run) / f"scores_{judge_run}_{split}.jsonl"
+
+
+def done_path(paths: Paths, cand_run: str, judge_run: str, split: str):
+    return paths.run_dir(cand_run) / f"scores_{judge_run}_{split}.done.json"
 
 
 def score_split(judge_run: str, cand_run: str, split: str, judge: tuple[Any, Any, Any, tuple[int, int]], *,
@@ -62,7 +66,9 @@ def score_split(judge_run: str, cand_run: str, split: str, judge: tuple[Any, Any
             if k % 50 == 0:
                 log.info("score %s: %d/%d sequences", split, k, len(groups))
     # questions with no candidate (or too long) get no scores: the selection falls back to greedy
-    return {"split": split, "n_scored_now": len(questions), "n_done_before": len(done), **stats}
+    res = {"split": split, "n_scored_now": len(questions), "n_done_before": len(done), **stats}
+    write_json(done_path(paths, cand_run, judge_run, split), res)
+    return res
 
 
 def read_scores(paths: Paths, cand_run: str, judge_run: str, split: str) -> dict[str, dict[str, Any]]:

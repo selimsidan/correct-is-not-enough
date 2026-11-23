@@ -123,6 +123,70 @@ def load_judge(paths: Paths, run: str, device: str, cfg: dict[str, Any] | None =
     return model, head, tok, (meta["yes_id"], meta["no_id"]), meta
 
 
+def finished_meta(paths: Paths, run: str, data_run: str, tc: dict[str, Any], with_results: bool
+                  ) -> dict[str, Any] | None:
+    """judge_meta.json of a run that finished with the same data, settings and inputs, else None."""
+    path = paths.run_dir(run, create=False) / "judge_meta.json"
+    if not path.exists():
+        return None
+    m = read_json(path)
+    if not m.get("complete"):
+        return None  # stopped early (max_steps): training continues from the newest checkpoint
+    same = (m.get("data_run") == data_run and bool(m.get("with_results")) == with_results
+            and m.get("init_from") == tc.get("init_from") and m.get("train", tc) == tc)
+    if not same:
+        raise RuntimeError(f"runs/{run} holds a different finished judge ({path}); use a new run name")
+    return m
+
+
+def untrained_judge(run: str, *, init_from: str | None = None, with_results: bool = True,
+                    paths: Paths | None = None, jcfg: dict[str, Any] | None = None, cfg: dict[str, Any] | None = None,
+                    gen_cfg: dict[str, Any] | None = None, device: str | None = None) -> dict[str, Any]:
+    """A judge run with no judge training (ablation): the model asked the judge's yes/no question as it is.
+    init_from None: the plain base model (a new LoRA adapter, whose B matrices start at zero, so it changes
+    nothing); else a copy of that run's adapter. The cost head is zero. Written like a trained judge, so
+    `score` and `vote` read it unchanged."""
+    import torch
+
+    from effsql.judge.model import save_cost_head
+    from effsql.train.sft import base_model_cfg, load_model, load_tokenizer
+
+    paths = paths or load_paths()
+    jcfg = jcfg or load_config("judge.yaml")
+    cfg = cfg or load_config("train.yaml")
+    gen_cfg = gen_cfg or load_config("generate.yaml")
+    run_dir = paths.run_dir(run)
+    meta_path = run_dir / "judge_meta.json"
+    if meta_path.exists():
+        m = read_json(meta_path)
+        if m.get("untrained") and m.get("init_from") == init_from and bool(m.get("with_results")) == with_results:
+            return m
+        raise RuntimeError(f"runs/{run} holds a different judge; use a new run name")
+    model_cfg = base_model_cfg(cfg, gen_cfg)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    tok = load_tokenizer(model_cfg)
+    yes_no = answer_token_ids(tok)
+    init_dir = paths.run_dir(init_from, create=False) / "adapter" if init_from else None
+    model = load_model(model_cfg, {**cfg["sft"], "gradient_checkpointing": False}, device, init_dir)
+    adapter, tmp = run_dir / "adapter", run_dir / "adapter.tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    model.save_pretrained(str(tmp))
+    if adapter.exists():
+        shutil.rmtree(adapter)
+    tmp.replace(adapter)
+    head = new_cost_head(model.config.hidden_size, device)
+    save_cost_head(head, run_dir / "cost_head.pt")
+    meta = {"data_run": None, "init_from": init_from, "base_id": model_cfg["id"],
+            "base_revision": model_cfg.get("revision"), "yes_id": yes_no[0], "no_id": yes_no[1],
+            "hidden_size": head.in_features, "n_steps": 0, "complete": True, "untrained": True,
+            "judge_version": JUDGE_VERSION, "with_results": with_results,
+            "timeout_s": jcfg["vote"]["timeout_s"] if with_results else None}
+    write_json(meta_path, meta)
+    log.info("untrained judge written to %s (init_from %s)", run_dir, init_from)
+    return meta
+
+
 def train_judge(run: str, data_run: str, *, paths: Paths | None = None, jcfg: dict[str, Any] | None = None,
                 cfg: dict[str, Any] | None = None, gen_cfg: dict[str, Any] | None = None,
                 max_steps: int | None = None, device: str | None = None, with_results: bool = False) -> dict[str, Any]:
@@ -141,6 +205,10 @@ def train_judge(run: str, data_run: str, *, paths: Paths | None = None, jcfg: di
     cfg = cfg or load_config("train.yaml")
     gen_cfg = gen_cfg or load_config("generate.yaml")
     tc, sft = jcfg["train"], cfg["sft"]
+    done = finished_meta(paths, run, data_run, tc, with_results)
+    if done is not None and not max_steps:
+        log.info("judge %s is already trained with these settings; nothing to do", run)
+        return done
     model_cfg = base_model_cfg(cfg, gen_cfg)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     gpu = check_gpu(device, sft)
@@ -261,7 +329,7 @@ def train_judge(run: str, data_run: str, *, paths: Paths | None = None, jcfg: di
             "hidden_size": head.in_features, "n_steps": n_steps, "gpu": gpu, "train_questions": tstats,
             "val_questions": vstats, "val_final": final, "complete": n_steps == full_steps,
             "judge_version": JUDGE_VERSION, "with_results": with_results,
-            "timeout_s": timeout_s if with_results else None}
+            "timeout_s": timeout_s if with_results else None, "train": tc}
     write_json(run_dir / "judge_meta.json", meta)
     log.info("judge written to %s; validation %s", run_dir, final)
     return meta

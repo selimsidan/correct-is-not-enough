@@ -102,6 +102,25 @@ def question_record(qid: str, db_id: str, own: list[dict[str, Any]], pool: list[
          "label": int(c["status"] == CORRECT), "cost": costs.get(norm_sql(c["sql"]))} for c in chosen]}
 
 
+def add_stats(stats: dict[str, Any], part: str, rec: dict[str, Any]) -> None:
+    s = stats.setdefault(part, {"n_questions": 0, "n_candidates": 0, "n_yes": 0, "n_cost": 0, "n_own": 0,
+                                "n_questions_all_no": 0, "n_questions_all_yes": 0})
+    labels = [c["label"] for c in rec["cands"]]
+    s["n_questions"] += 1
+    s["n_candidates"] += len(labels)
+    s["n_yes"] += sum(labels)
+    s["n_cost"] += sum(c["cost"] is not None for c in rec["cands"])
+    s["n_own"] += sum(c["source"] == "own" for c in rec["cands"])
+    s["n_questions_all_no"] += not any(labels)
+    s["n_questions_all_yes"] += all(labels)
+
+
+def finish_stats(stats: dict[str, Any]) -> None:
+    for s in stats.values():
+        s["share_yes"] = s["n_yes"] / max(s["n_candidates"], 1)
+        s["candidates_per_question"] = s["n_candidates"] / max(s["n_questions"], 1)
+
+
 def build_judge_data(run: str, *, paths: Paths | None = None, cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     from effsql.data.bird import load_examples
     from effsql.io import append_jsonl
@@ -124,19 +143,8 @@ def build_judge_data(run: str, *, paths: Paths | None = None, cfg: dict[str, Any
             continue
         part = "val" if e.db_id in holdout else "train"
         append_jsonl(outs[part], [rec])
-        s = stats.setdefault(part, {"n_questions": 0, "n_candidates": 0, "n_yes": 0, "n_cost": 0, "n_own": 0,
-                                    "n_questions_all_no": 0, "n_questions_all_yes": 0})
-        labels = [c["label"] for c in rec["cands"]]
-        s["n_questions"] += 1
-        s["n_candidates"] += len(labels)
-        s["n_yes"] += sum(labels)
-        s["n_cost"] += sum(c["cost"] is not None for c in rec["cands"])
-        s["n_own"] += sum(c["source"] == "own" for c in rec["cands"])
-        s["n_questions_all_no"] += not any(labels)
-        s["n_questions_all_yes"] += all(labels)
-    for s in stats.values():
-        s["share_yes"] = s["n_yes"] / max(s["n_candidates"], 1)
-        s["candidates_per_question"] = s["n_candidates"] / max(s["n_questions"], 1)
+        add_stats(stats, part, rec)
+    finish_stats(stats)
     meta = {"data_version": DATA_VERSION, "config": dc, "holdout_db_ids": sorted(holdout), "stats": stats}
     write_json(run_dir / "data_meta.json", meta)
     log.info("judge data %s: %s", run, stats)
@@ -147,3 +155,47 @@ def read_part(run_dir: Path, part: str) -> list[dict[str, Any]]:
     from effsql.io import read_jsonl
 
     return read_jsonl(run_dir / f"judge_{part}.jsonl")
+
+
+def derive_judge_data(src: str, run: str, sources: tuple[str, ...] = ("own",), *,
+                      paths: Paths | None = None) -> dict[str, Any]:
+    """A judge data run that keeps only the candidates of `sources` from the data run `src`, with the answer-time
+    results of `src` (exec_<part>.jsonl) carried over, so nothing is executed again. Cost labels are recomputed
+    over the kept candidates; questions left without a candidate are dropped. Used for the ablation that trains
+    the judge on its generator's own answers only (sources=("own",)). Since the own answers come first in a
+    question and number at most max_candidates, the kept candidates equal what `data` would select from own
+    answers alone."""
+    from effsql.io import append_jsonl
+    from effsql.judge.vote import read_exec
+
+    paths = paths or load_paths()
+    src_dir, run_dir = paths.run_dir(src, create=False), paths.run_dir(run)
+    smeta = read_json(src_dir / "data_meta.json")
+    stats: dict[str, Any] = {}
+    for part in ("train", "val"):
+        ex = read_exec(paths, src, part)
+        out_d, out_x = run_dir / f"judge_{part}.jsonl", run_dir / f"exec_{part}.jsonl"
+        for f in (out_d, out_x):
+            if f.exists():
+                f.unlink()
+        for rec in read_part(src_dir, part):
+            res = ex[rec["qid"]]["results"]
+            if len(res) != len(rec["cands"]):
+                raise ValueError(f"{src}: exec_{part} does not match the candidates of {rec['qid']}")
+            keep = [i for i, c in enumerate(rec["cands"]) if c["source"] in sources]
+            if not keep:
+                continue
+            cands = [dict(rec["cands"][i]) for i in keep]
+            costs = cost_labels(cands, smeta["config"]["smooth_steps"])
+            for c in cands:
+                c["cost"] = costs.get(norm_sql(c["sql"]))
+            new = {**rec, "cands": cands}
+            append_jsonl(out_d, [new])
+            append_jsonl(out_x, [{"qid": rec["qid"], "results": [res[i] for i in keep]}])
+            add_stats(stats, part, new)
+    finish_stats(stats)
+    meta = {"data_version": DATA_VERSION, "config": {**smeta["config"], "sources": list(sources)},
+            "derived_from": src, "holdout_db_ids": smeta["holdout_db_ids"], "stats": stats}
+    write_json(run_dir / "data_meta.json", meta)
+    log.info("judge data %s (from %s, %s only): %s", run, src, "+".join(sources), stats)
+    return meta
