@@ -295,6 +295,35 @@ python -m effsql.judge score --run judge_cand_v1 --judge judge_v2               
 python -m effsql.judge vote --run judge_cand_v1 --judge judge_v2 --out vote_v2    # CPU
 ```
 
+### Ablations (notebooks 87, 88)
+
+Each run removes or changes one part of the final system; every comparison is on the same questions, with an
+exact McNemar test. Notebook 87 (A100, about 8 hours, one "Run all" that resumes after a disconnect):
+
+| Run | What changes |
+|---|---|
+| B3 | candidates from the SFT generator (before RL), chosen by `judge_v2` |
+| B5 | `judge_untrained`: the base model asked the judge's question with the result, no training |
+| B1 | `judge_v2_own`: trained on the generator's own answers only (no base-model pool) |
+| B4 | `judge_v2_nocost`: trained without the cost loss |
+| B2 | `judge_v2_base`: started from the plain base model instead of the generator's adapter |
+
+Notebook 88 (CPU) recomputes every choice from saved files and writes `ablations_report/report.txt`: the
+component ladder, the verifier ablations (including an execution majority vote with nothing learned), accuracy
+against the number of samples, the two prompts' candidates, results by difficulty, what the verifier learned,
+the cost spread of the model's own answers and worked examples.
+
+```bash
+python -m effsql.judge candidates --run judge_cand_sft --generator sft_v1_best_e1   # B3, GPU
+python -m effsql.judge untrained --run judge_untrained                             # B5, GPU
+python -m effsql.judge derive-data --src judge_data_v1 --run judge_data_own --sources own
+python -m effsql.judge train --run judge_v2_own --data judge_data_own --with-results          # B1
+python -m effsql.judge train --run judge_v2_nocost --data judge_data_v1 --with-results --cost-weight 0
+python -m effsql.judge train --run judge_v2_base --data judge_data_v1 --with-results --init-from none
+python -m effsql.ablate zero-shot-val --run zero_shot_v1                           # CPU
+python -m effsql.ablate report --out ablations_report                              # CPU, nothing executed
+```
+
 ### Compute and cost
 
 * GPU (L4) only for `generate`, `rewrite` and `predict`; everything else is CPU work. Part A runs its CPU steps on
